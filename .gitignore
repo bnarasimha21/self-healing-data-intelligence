@@ -1,0 +1,50 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.env.*
+.venv/
+venv/
+
+# Tooling/IDE
+.vscode/
+.idea/
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.cache/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Coverage/Reports
+.coverage
+htmlcov/
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+logs/
+*.log
+
+# Local data/output
+*.csv
+*.parquet
+*.feather
+*.arrow
+*.tsv
+
+# LangChain/LangGraph temp
+*.lc
