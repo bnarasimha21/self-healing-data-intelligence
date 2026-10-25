@@ -18,6 +18,13 @@ from langgraph.graph import StateGraph, START, END
 
 load_dotenv()
 
+# Columns the demo treats as required. Validation reports any that are missing and
+# repair adds them (as NaN, then filled by the NA rules). The sample CSV has all three.
+REQUIRED_COLUMNS = ["id", "date", "sales"]
+
+# Repair passes allowed before giving up and reporting what is still failing.
+MAX_REPAIR_PASSES = 2
+
 def coerce_numeric(df: pd.DataFrame, cols: List[str], errors: str = "coerce") -> Tuple[pd.DataFrame, List[str]]:
     logs = []
     for c in cols:
@@ -268,10 +275,10 @@ def node_plan(state: PipelineState) -> Dict[str, Any]:
     plan = [
         "Load CSV into DataFrame",
         "Infer candidate schema and required columns",
-        "Validate types/nulls",
-        "Detect anomalies (duplicates, outliers, date issues)",
-        "Apply self-healing repairs",
-        "Re-validate; if still failing and iterations < 2, repeat",
+        "Validate required columns/types/nulls",
+        "Apply self-healing repairs if validation fails",
+        "Re-validate; if still failing and repair passes < 2, repeat",
+        "Detect anomalies (duplicates, outliers, date issues) on the final data",
         "Summarize results"
     ]
     msg = "Plan:\n- " + "\n- ".join(plan)
@@ -296,8 +303,7 @@ def infer_schema_and_requirements(df: pd.DataFrame) -> Tuple[Dict[str, str], Lis
             numeric_cols.append(c)
         else:
             expected_schema[c] = "string"
-    # Pretend these are required for the task
-    required_columns = list(df.columns)  # In a stricter demo, add a known required col like 'id'
+    required_columns = list(REQUIRED_COLUMNS)
     return expected_schema, required_columns, date_cols
 
 def node_validate(state: PipelineState) -> Dict[str, Any]:
@@ -388,7 +394,7 @@ def node_decide(state: PipelineState) -> Dict[str, Any]:
     done = False
     if state.validation and state.validation.passed:
         done = True
-    elif next_iteration >= 2:  # max 2 repair passes for demo
+    elif next_iteration > MAX_REPAIR_PASSES:  # iteration 1 is the pre-repair validation
         done = True
     # Append a compact snapshot of the DataFrame after this iteration
     df_preview = ""
@@ -440,14 +446,16 @@ def build_graph():
     graph.add_edge(START, "plan")
     graph.add_edge("plan", "load")
     graph.add_edge("load", "validate")
-    graph.add_edge("anomaly", "repair")
     graph.add_edge("repair", "validate")
     graph.add_edge("validate", "decide")
+    # Repair/validate loop until validation passes or the pass limit is hit,
+    # then run anomaly detection once on the final data.
     graph.add_conditional_edges(
         "decide",
-        lambda s: "summarize" if s.done else "anomaly",
-        {"summarize": "summarize", "anomaly": "anomaly"}
+        lambda s: "anomaly" if s.done else "repair",
+        {"anomaly": "anomaly", "repair": "repair"}
     )
+    graph.add_edge("anomaly", "summarize")
     graph.add_edge("summarize", END)
     return graph.compile()
 
