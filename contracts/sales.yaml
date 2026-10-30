@@ -1,0 +1,43 @@
+# Data contract for the demo sales table.
+# Field names follow a small subset of the Open Data Contract Standard.
+# Every check has a severity (error blocks a run from passing, warn reports)
+# and an on_violation policy (propose_fix, quarantine, report_only). Defaults
+# per check kind live in shdi/contract.py (DEFAULT_POLICY); override them per
+# column under `checks:` or for the whole dataset under the top-level `checks:`.
+apiVersion: shdi/v1
+name: sales
+version: 1.0.0
+description: Daily sales by region. One row per id.
+primary_key: [id]
+max_null_ratio: 0.3
+allow_duplicate_rows: false
+anomaly:
+  mad_threshold: 3.5
+columns:
+  id:
+    type: integer
+    nullable: false
+  date:
+    type: date
+    nullable: true
+    min: "1970-01-01"
+    max: today
+  sales:
+    type: number
+    nullable: false
+    min: 0
+    max: 100000
+    measure: true
+    # A value above max that lands inside [min, max] when divided by one of
+    # these factors is proposed as a unit error (rescale) instead of a clamp.
+    unit_factors: [1000]
+    checks:
+      type: {severity: error, on_violation: quarantine}
+  region:
+    type: string
+    nullable: false
+    default: Unknown
+    accepted_values: [North, South, East, West, Unknown]
+  notes:
+    type: string
+    nullable: true
