@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from langgraph.checkpoint.sqlite import SqliteSaver
+from opentelemetry import trace as otel_trace
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 from typing_extensions import Annotated, TypedDict
@@ -35,7 +36,9 @@ from .config import checkpoint_db_path
 from .connectors import open_sink, open_source, to_csv_bytes
 from .connectors.base import frame_fingerprint
 from .contract import contract_from_dict
+from .llm import ChatModelFactory, explain_proposals, llm_mode, write_plan
 from .repairs import apply_proposals, propose_repairs
+from .tracing import traced_node
 
 STATIC_PLAN = [
     "Load the source read-only and fingerprint it",
@@ -94,8 +97,13 @@ def _as_of(state: PipelineState) -> dt.date:
     return dt.date.fromisoformat(state["as_of"])
 
 
-def node_plan(state: PipelineState) -> Dict[str, Any]:
-    return {"messages": ["Plan:\n- " + "\n- ".join(STATIC_PLAN)]}
+def node_plan(state: PipelineState, chat_model_factory: Optional[ChatModelFactory] = None) -> Dict[str, Any]:
+    plan, note = STATIC_PLAN, None
+    if llm_mode() == "plan":
+        lines, note = write_plan(state.get("user_request", ""), chat_model_factory)
+        plan = lines or STATIC_PLAN
+    msgs = ([note] if note else []) + ["Plan:\n- " + "\n- ".join(plan)]
+    return {"messages": msgs}
 
 
 def node_load(state: PipelineState) -> Dict[str, Any]:
@@ -122,7 +130,7 @@ def node_validate(state: PipelineState) -> Dict[str, Any]:
     return {"checks_before": checks, "anomalies_before": anomalies, "messages": [msg]}
 
 
-def node_propose(state: PipelineState) -> Dict[str, Any]:
+def node_propose(state: PipelineState, chat_model_factory: Optional[ChatModelFactory] = None) -> Dict[str, Any]:
     from .checks import CheckResult
 
     contract = contract_from_dict(state["contract"])
@@ -130,10 +138,17 @@ def node_propose(state: PipelineState) -> Dict[str, Any]:
     checks = [CheckResult(**c) for c in state["checks_before"]]
     proposals = [p.to_dict() for p in propose_repairs(df, contract, checks, _as_of(state))]
     need = sum(1 for p in proposals if p["risk"] == "needs_approval")
-    return {
-        "proposals": proposals,
-        "messages": [f"Proposed {len(proposals)} changes, {need} need approval"],
-    }
+    messages = [f"Proposed {len(proposals)} changes, {need} need approval"]
+    if llm_mode() == "explain" and need:
+        # Text for the reviewer only: apply never reads `explanation`.
+        explanations, note = explain_proposals(proposals, chat_model_factory)
+        for p in proposals:
+            if p["id"] in explanations:
+                p["explanation"] = explanations[p["id"]]
+        messages.append(f"LLM explained {len(explanations)} of {need} proposals")
+        if note:
+            messages.append(note)
+    return {"proposals": proposals, "messages": messages}
 
 
 def _resume_ids(value: Any, key: str) -> List[str]:
@@ -232,6 +247,17 @@ def node_apply(state: PipelineState) -> Dict[str, Any]:
     anomalies_after = detect_anomalies(result.output, contract, parsed)
     errors_after = failing(checks_after, "error")
     status = "passed" if not errors_after else "failed_checks"
+    otel_trace.get_current_span().add_event(
+        "shdi.apply.written",
+        {
+            "shdi.applied": len(result.applied),
+            "shdi.skipped": len(result.skipped),
+            "shdi.rows_staged": staged,
+            "shdi.rows_quarantined": quarantined,
+            "shdi.rows_dropped": result.rows_dropped,
+            "shdi.cells_changed": result.cells_changed,
+        },
+    )
     apply_info = {
         "status": "applied",
         "applied": result.applied,
@@ -323,16 +349,28 @@ def make_checkpointer(path: Optional[str] = None) -> SqliteSaver:
     return SqliteSaver(sqlite3.connect(str(p), check_same_thread=False))
 
 
-def build_graph(checkpointer: Any = None):
-    """Compile the workflow. Uses a SQLite checkpointer from SHDI_CHECKPOINT_DB by default."""
+NODE_ORDER = ["plan", "load", "validate", "propose", "approve", "apply", "summarize"]
+
+
+def build_graph(checkpointer: Any = None, chat_model_factory: Optional[ChatModelFactory] = None):
+    """Compile the workflow.
+
+    Uses a SQLite checkpointer from SHDI_CHECKPOINT_DB by default.
+    `chat_model_factory` replaces the default Gradient model for SHDI_LLM=plan
+    or explain (tests pass a stub).
+    """
     graph = StateGraph(PipelineState)
-    graph.add_node("plan", node_plan)
-    graph.add_node("load", node_load)
-    graph.add_node("validate", node_validate)
-    graph.add_node("propose", node_propose)
-    graph.add_node("approve", node_approve)
-    graph.add_node("apply", node_apply)
-    graph.add_node("summarize", node_summarize)
+    nodes = {
+        "plan": lambda state: node_plan(state, chat_model_factory),
+        "load": node_load,
+        "validate": node_validate,
+        "propose": lambda state: node_propose(state, chat_model_factory),
+        "approve": node_approve,
+        "apply": node_apply,
+        "summarize": node_summarize,
+    }
+    for name in NODE_ORDER:
+        graph.add_node(name, traced_node(name, nodes[name]))
     graph.add_edge(START, "plan")
     graph.add_edge("plan", "load")
     graph.add_edge("load", "validate")

@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 from . import workflow
 from .connectors import open_source
 from .infer import infer_contract_yaml
+from .tracing import shutdown as flush_traces
 
 
 def _fmt_keys(keys: List[Dict[str, Any]]) -> str:
@@ -130,9 +131,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"wrote {args.output}")
             else:
                 print(text, end="")
-    except (workflow.WorkflowError, ValueError, FileNotFoundError, RuntimeError) as e:
+    except (workflow.WorkflowError, ValueError, FileNotFoundError, RuntimeError, PermissionError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    finally:
+        flush_traces()
     return 0
 
 

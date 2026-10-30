@@ -8,3 +8,5 @@ langgraph>=1.0
 langgraph-checkpoint-sqlite>=2.0
 duckdb>=1.0
 psycopg[binary]>=3.1
+opentelemetry-api>=1.25
+opentelemetry-sdk>=1.25

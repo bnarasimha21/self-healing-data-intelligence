@@ -15,7 +15,7 @@ plan -> load -> validate -> propose -> approve (pause) -> apply -> summarize
 
 | Node | What it does |
 |---|---|
-| plan | Records the static run plan. |
+| plan | Records the run plan (written by the model when `SHDI_LLM=plan`). |
 | load | Reads the source as text and fingerprints it (sha256 over the content). |
 | validate | Runs every check in the contract, plus review-only outlier detection on `measure` columns. |
 | propose | Turns each failing check into proposed changes, each with row keys, old values, new values, a reason and a risk level. Nothing is changed yet. |
@@ -132,6 +132,44 @@ the source later. To try DuckDB with the sample:
 python examples/seed_duckdb.py examples/dirty_sales.csv .shdi/demo.duckdb sales
 shdi run duckdb:.shdi/demo.duckdb#sales --contract contracts/sales.yaml
 ```
+
+## Tracing
+
+Set `SHDI_OTEL=1` to trace runs with OpenTelemetry. Spans print to stderr by
+default; set `OTEL_EXPORTER_OTLP_ENDPOINT` (and install
+`opentelemetry-exporter-otlp-proto-http`) to send them to any OTLP backend.
+
+Each start or resume is one trace: a `shdi.run` or `shdi.resume` root span with
+one child span per node (`shdi.plan`, `shdi.load`, ... `shdi.summarize`). Node
+spans carry `shdi.run_id`, `shdi.node`, `shdi.proposals.count`,
+`shdi.checks.failed` and decision counts. The node that pauses for approval
+ends its span with `shdi.interrupted=true`, not an error. `apply` adds a
+`shdi.apply.written` event with what it wrote. Model calls get a
+`chat <model>` span with `gen_ai.*` attributes.
+
+## The optional LLM
+
+The pipeline runs fully without a model. `SHDI_LLM` turns one on:
+
+| `SHDI_LLM` | What the model does |
+|---|---|
+| `off` (default) | Nothing. `langchain-gradient` is never imported. |
+| `plan` | Writes the run plan shown in the summary. Informational only. |
+| `explain` | Writes a one-line plain-English reason for each `needs_approval` proposal, shown by `shdi review`. |
+
+The model never produces values: explanations are stored as text on the
+proposal, and `apply` does not read them, so the output is identical with the
+model on or off. The prompt includes cell values from the source, so treat an
+explanation as a hint written from untrusted data, not as a decision. A model
+failure is reported in the summary and the run continues without explanations.
+
+```bash
+pip install -r requirements-llm.txt
+export DIGITALOCEAN_INFERENCE_KEY=...      # set it in your shell, never in a file in the repo
+SHDI_LLM=explain shdi run examples/dirty_sales.csv --contract contracts/sales.yaml
+```
+
+`SHDI_LLM_MODEL` picks the Gradient model (default `llama3.3-70b-instruct`).
 
 ## Tests
 

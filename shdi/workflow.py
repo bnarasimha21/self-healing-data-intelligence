@@ -16,6 +16,7 @@ from .audit import AuditLog, now_iso
 from .connectors import canonical_uri
 from .contract import Contract, load_contract
 from .graph import build_graph
+from .tracing import tracer
 
 
 class WorkflowError(ValueError):
@@ -57,7 +58,11 @@ def start_run(
         "user_request": user_request,
         "messages": [],
     }
-    graph.invoke(state, _config(run_id))
+    with tracer().start_as_current_span("shdi.run") as span:
+        span.set_attribute("shdi.run_id", run_id)
+        span.set_attribute("shdi.source", state["source_uri"])
+        span.set_attribute("shdi.contract", contract.name)
+        graph.invoke(state, _config(run_id))
     return status(run_id, graph)
 
 
@@ -136,6 +141,17 @@ def decide(
     if not (new_approved or new_rejected or approve_all or reject_all):
         st["ignored"] = sorted(set(approved) | set(rejected))
         return st
+    with tracer().start_as_current_span("shdi.resume") as span:
+        span.set_attribute("shdi.run_id", run_id)
+        span.set_attribute("shdi.reviewer", reviewer)
+        span.set_attribute("shdi.decisions.submitted", len(new_approved) + len(new_rejected))
+        _resume(graph, run_id, new_approved, new_rejected, approve_all, reject_all, reviewer)
+    out = status(run_id, graph)
+    out["ignored"] = sorted((set(approved) | set(rejected)) & already)
+    return out
+
+
+def _resume(graph, run_id, new_approved, new_rejected, approve_all, reject_all, reviewer) -> None:
     graph.invoke(
         Command(
             resume={
@@ -149,9 +165,6 @@ def decide(
         ),
         _config(run_id),
     )
-    out = status(run_id, graph)
-    out["ignored"] = sorted((set(approved) | set(rejected)) & already)
-    return out
 
 
 def audit_records(run_id: str) -> list:
