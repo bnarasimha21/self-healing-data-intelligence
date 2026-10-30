@@ -171,6 +171,34 @@ SHDI_LLM=explain shdi run examples/dirty_sales.csv --contract contracts/sales.ya
 
 `SHDI_LLM_MODEL` picks the Gradient model (default `llama3.3-70b-instruct`).
 
+## Benchmark
+
+`make bench` generates 10,000 clean sales rows from a fixed seed, injects 1,050
+labelled defects (150 of each type, one per row, duplicates appended as exact
+copies), runs the real graph on the dirty DuckDB table with every proposal
+auto-approved, and scores staging and quarantine against the clean data. Full
+output in [bench/RESULTS.md](bench/RESULTS.md).
+
+| Defect | Injected | Detection precision | Detection recall | Restored | Quarantined | Neutralized | Wrong | Missed | Fix accuracy |
+|---|---|---|---|---|---|---|---|---|---|
+| type_pollution | 150 | 100.0% | 100.0% | 0 | 150 | 0 | 0 | 0 | 100.0% |
+| null | 150 | 100.0% | 100.0% | 0 | 75 | 75 | 0 | 0 | 50.0% |
+| duplicate | 150 | 100.0% | 100.0% | 150 | 0 | 0 | 0 | 0 | 100.0% |
+| out_of_range | 150 | 100.0% | 100.0% | 0 | 150 | 0 | 0 | 0 | 100.0% |
+| unit_error | 150 | 100.0% | 100.0% | 150 | 0 | 0 | 0 | 0 | 100.0% |
+| future_date | 150 | 100.0% | 100.0% | 0 | 0 | 150 | 0 | 0 | 0.0% |
+| pre_1970_date | 150 | 100.0% | 100.0% | 0 | 0 | 150 | 0 | 0 | 0.0% |
+| **all** | 1050 | | | 300 | 375 | 375 | 0 | 0 | 64.3% |
+
+On the 45,500 clean cells of the dirty table nothing was changed, no clean row
+was lost and no outlier was reported. The clean data run on its own proposes no
+value changes. Fix accuracy counts a defect as handled when the clean value is
+back in staging or the row is in quarantine. Out-of-range dates are set to null
+because the true date cannot be known, so they count as neutralized, not fixed;
+a missing region gets the contract default `Unknown`, which counts the same way.
+`tests/test_benchmark_smoke.py` runs the same pipeline on 500 rows and fails if
+any of these numbers drop.
+
 ## Tests
 
 ```bash
