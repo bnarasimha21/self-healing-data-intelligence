@@ -1,78 +1,114 @@
 # Self-Healing Data Intelligence
 
-## Overview
-Self‑Healing Data Intelligence is a small, demonstrative pipeline that ingests CSV data, validates schema and types, detects anomalies, applies deterministic repairs, and summarizes results. It is orchestrated with LangGraph (graph-based state transitions) and can optionally use an LLM just to propose a short execution plan (no data mutation by the LLM). The system distinguishes between structural validation (schema, dtypes, nulls) and anomaly detection (duplicates, outliers, suspicious dates), allowing clean separation of “must‑fix” issues versus “review” items.
+A LangGraph workflow that checks a dataset against a declared **data contract**,
+proposes repairs for what fails, **pauses for a human to approve or reject each
+proposed change**, then writes the approved result to a staging table and the
+rows it could not fix to a quarantine table. The source is never modified.
+Every decision and every applied change is recorded in an append-only audit
+log, keyed by row and carrying the old and new values.
 
----
-
-## difference between validation and anomaly detection?
-
-| **Validation** | **Anomaly Detection** |
-|----------------|----------------------|
-| Structural checks | Quality checks |
-| Does schema match? | Does data look normal? |
-| Are types correct? | Are there outliers? |
-| Are required columns present? | Are there duplicates? |
-| Is null ratio acceptable? | Are dates suspicious? |
-| **Pass/Fail with issues list** | **Findings report with details** |
-
-Example:
-- Validation fails: "Column 'date' not parsed as datetime"
-- Anomaly detection finds: "Found 1 duplicate rows", "High values in 'sales' above P99: 1 rows"
-
-They complement each other in the pipeline.
-
----
-
-## Pipeline Execution Flow
+## How a run flows
 
 ```
-START
-  ↓
-Plan (LLM bullet list if DIGITALOCEAN_INFERENCE_KEY works, otherwise a static list; informational only)
-  ↓
-Load CSV into DataFrame
-  ↓
-Validate (first pass, on the raw data)
-  ↓
-Decide:
-  - validation passed        → go to Anomaly Detection
-  - repair passes used = 2   → go to Anomaly Detection (issues are reported, not hidden)
-  - otherwise                → Repair
-  ↓
-Repair (then back to Validate, then Decide again):
-  - Add missing required columns (id, date, sales; see REQUIRED_COLUMNS in main.py)
-  - Parse date columns, coerce numeric columns
-  - Fill missing values (0 for numbers, "" for text)
-  - Clamp numeric columns to their 1st to 99th percentile
-  ↓
-Anomaly Detection (once, on the final data):
-  - Duplicate rows
-  - Outliers: |z-score| > 3, plus values above the 99th percentile
-  - Suspicious dates (before 1970 or in the future)
-  ↓
-Summarize:
-  - Node messages, final shape, columns
-  - Validation result and remaining issues
-  - Anomaly findings
-  - Repair log count
-  ↓
-END
+plan -> load -> validate -> propose -> approve (pause) -> apply -> summarize
 ```
 
-### Behaviors worth knowing
+| Node | What it does |
+|---|---|
+| plan | Records the static run plan. |
+| load | Reads the source as text and fingerprints it (sha256 over the content). |
+| validate | Runs every check in the contract, plus review-only outlier detection on `measure` columns. |
+| propose | Turns each failing check into proposed changes, each with row keys, old values, new values, a reason and a risk level. Nothing is changed yet. |
+| approve | Pauses the graph with `langgraph.types.interrupt()` until every `needs_approval` proposal has a decision. State is checkpointed to SQLite, so the run can be resumed from a different process, hours later. |
+| apply | Re-reads the source and refuses to write if its fingerprint changed during the pause. Applies only approved proposals, writes staging and quarantine, records the audit trail, and re-runs every check on the output. |
+| summarize | A before/after report: failing checks before and after, cells changed, rows quarantined, duplicates dropped. |
 
-- **Clamping changes data.** Repair clips each numeric column to its [P1, P99] range, which silently overwrites extreme values. Because anomaly detection runs after repair, it scans the clamped data, so the z-score check rarely fires on heavy outliers; the "above P99" check is the one that usually catches them. Clamping only applies to columns that were already numeric before coercion and have at least 5 values, so a text-polluted column (like `sales` with "three hundred") is clamped on the second repair pass, not the first.
-- **Required columns** are the fixed list `REQUIRED_COLUMNS = ["id", "date", "sales"]` in `main.py`. Edit it for your own data. A missing one fails validation, and repair adds it as NaN and then fills it.
-- **The LLM never touches the data.** It only writes the plan text.
-- A CSV that already passes validation skips repair entirely.
+Proposals marked `low` risk (a type cast that changes no text) are approved by
+policy if a reviewer has not rejected them by the time the last `needs_approval`
+proposal is decided. Rejecting everything produces an output that is
+byte-identical to the input.
+
+## The data contract
+
+Rules live in YAML, not in code. `contracts/sales.yaml` describes the bundled sample:
+
+```yaml
+apiVersion: shdi/v1
+name: sales
+primary_key: [id]
+max_null_ratio: 0.3
+columns:
+  id:     {type: integer, nullable: false}
+  date:   {type: date, min: "1970-01-01", max: today}
+  sales:
+    type: number
+    nullable: false
+    min: 0
+    max: 100000
+    measure: true          # only measure columns are scanned for outliers
+    unit_factors: [1000]   # 400000 -> 400 is proposed as a unit fix, not a clamp
+  region: {type: string, nullable: false, default: Unknown,
+           accepted_values: [North, South, East, West, Unknown]}
+  notes:  {type: string}
+```
+
+Each check has a severity (`error` or `warn`) and an `on_violation` action
+(`propose_fix`, `quarantine` or `report_only`), with defaults per check kind and
+overrides per column or for the whole dataset. Unknown keys are rejected, so a
+typo in a contract fails loudly.
+
+What each failure turns into:
+
+| Failure | Proposed change |
+|---|---|
+| Value that is not the declared type (`three hundred` in a number column) | Quarantine the row. A text value is never silently turned into 0. |
+| Number outside `min`/`max` | Clamp to the bound, or rescale when a `unit_factors` entry brings it back in range. |
+| Date outside `min`/`max` in a nullable column | Set it to null. |
+| Non-ISO date (`01/06/2024`) | Cast to ISO; flagged as ambiguous and always `needs_approval`. |
+| Missing value in a non-nullable column | Fill the column's `default`, or quarantine when it has none. |
+| Exact duplicate row | Drop the extra copy. |
+| Same primary key, different content | Quarantine every row with that key. |
+
+Outliers use the median absolute deviation (modified z-score above 3.5), only on
+columns marked `measure`, so an `id` column is never reported. They are
+reported for review and never changed automatically.
+
+To start a contract for your own data, draft one and edit it:
+
+```bash
+shdi infer-contract my_data.csv -o contracts/my_data.yaml
+```
 
 ## Running
 
 ```bash
-pip install -r requirements.txt
-export DIGITALOCEAN_INFERENCE_KEY=...   # optional; without it the static plan is used
-python main.py
+python -m venv .venv && . .venv/bin/activate
+pip install -e .                 # installs the `shdi` command
+python main.py                   # demo: runs the sample with every proposal auto-approved
 ```
 
-`python main.py` runs the built-in dirty sample CSV and prints the summary.
+The review loop:
+
+```bash
+shdi run examples/dirty_sales.csv --contract contracts/sales.yaml   # prints proposals and pauses
+shdi review <run_id>
+shdi reject <run_id> --ids p8
+shdi approve <run_id> --all
+shdi status <run_id>
+shdi audit <run_id>
+```
+
+For CSV sources the output goes to `$SHDI_SINK_DIR` (default `.shdi/out/`) as
+`<name>__shdi_staging.csv` and `<name>__shdi_quarantine.csv`. Checkpoints and
+the audit log live in `$SHDI_HOME` (default `.shdi/`).
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The tests drive the real compiled graph end to end: pausing, resuming from a new
+process, partial approval, reject-all byte identity, the audit trail and a
+source that changes during the pause.
