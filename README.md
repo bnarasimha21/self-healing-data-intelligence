@@ -102,6 +102,37 @@ For CSV sources the output goes to `$SHDI_SINK_DIR` (default `.shdi/out/`) as
 `<name>__shdi_staging.csv` and `<name>__shdi_quarantine.csv`. Checkpoints and
 the audit log live in `$SHDI_HOME` (default `.shdi/`).
 
+## Sources and sinks
+
+| Source URI | Staging and quarantine go to |
+|---|---|
+| `data.csv` or `csv:path/data.csv` | `<name>__shdi_staging.csv`, `<name>__shdi_quarantine.csv` in `$SHDI_SINK_DIR` |
+| `duckdb:///abs/path/file.duckdb#table` or `duckdb:rel/path.duckdb#schema.table` | tables `<table>__shdi_staging`, `<table>__shdi_quarantine` in the same file |
+| `postgres:schema.table` | tables `<schema>.<table>__shdi_staging`, `<schema>.<table>__shdi_quarantine` |
+
+The source is read through a read-only connection and is never written. Sinks
+refuse any table name without one of the two suffixes. Each staging and
+quarantine row carries `shdi_run_id`, `shdi_applied_at` and `shdi_source_row`;
+quarantine rows also carry `shdi_proposal_id` and `shdi_reason`, and keep their
+raw values as text. Re-applying a run replaces that run's rows instead of
+appending duplicates.
+
+Postgres connection strings come only from the environment, never from the URI
+or the command line: `SHDI_PG_DSN` reads the source (give it a role with
+`SELECT` and nothing else) and `SHDI_PG_SINK_DSN` writes staging and quarantine
+(defaults to `SHDI_PG_DSN`). A URI that contains credentials is rejected.
+Postgres tables have no insertion order, so the source is read sorted on every
+column; `shdi_source_row` is the position in that order, and row keys in
+proposals and the audit log always include the primary key.
+
+In-memory DuckDB is not accepted, because a paused run must be able to re-open
+the source later. To try DuckDB with the sample:
+
+```bash
+python examples/seed_duckdb.py examples/dirty_sales.csv .shdi/demo.duckdb sales
+shdi run duckdb:.shdi/demo.duckdb#sales --contract contracts/sales.yaml
+```
+
 ## Tests
 
 ```bash
@@ -111,4 +142,14 @@ pytest
 
 The tests drive the real compiled graph end to end: pausing, resuming from a new
 process, partial approval, reject-all byte identity, the audit trail and a
-source that changes during the pause.
+source that changes during the pause. DuckDB tests always run. The Postgres
+tests are marked `postgres` and skip unless `SHDI_PG_DSN` is set; to run them
+against a throwaway server:
+
+```bash
+docker compose -p shdi-test -f docker-compose.test.yml up -d --wait
+export SHDI_PG_DSN=postgresql://shdi_reader:reader@127.0.0.1:55433/shdi
+export SHDI_PG_SINK_DSN=postgresql://shdi_writer:writer@127.0.0.1:55433/shdi
+pytest -m postgres
+docker compose -p shdi-test -f docker-compose.test.yml down -v
+```

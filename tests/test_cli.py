@@ -100,3 +100,21 @@ def test_infer_contract_cli_writes_loadable_yaml(tmp_path):
     assert draft.columns["date"].type == "date"
     assert draft.primary_key == ["id"]
     assert draft.columns["sales"].measure and not draft.columns["id"].measure
+
+
+def test_cli_runs_the_shipped_sample_and_a_duckdb_source(tmp_path):
+    home = tmp_path / "home"
+    r = shdi("run", "examples/dirty_sales.csv", "--contract", "contracts/sales.yaml", "--auto-approve",
+             "--run-id", "ex1", "--sink-dir", str(tmp_path / "out"), env_home=home)
+    assert r.returncode == 0, r.stderr
+    assert "Run ex1: passed" in r.stdout
+    assert (tmp_path / "out" / "dirty_sales__shdi_staging.csv").exists()
+
+    db = tmp_path / "landing.duckdb"
+    seeded = subprocess.run([sys.executable, "examples/seed_duckdb.py", "examples/dirty_sales.csv", str(db), "sales"],
+                            capture_output=True, text=True, cwd=ROOT)
+    assert seeded.returncode == 0, seeded.stderr
+    r = shdi("run", f"duckdb://{db}#sales", "--contract", "contracts/sales.yaml", "--auto-approve", "--run-id", "ex2",
+             env_home=home)
+    assert r.returncode == 0, r.stderr
+    assert "Run ex2: passed" in r.stdout
