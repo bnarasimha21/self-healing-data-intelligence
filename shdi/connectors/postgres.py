@@ -10,20 +10,21 @@ from __future__ import annotations
 
 import datetime as dt
 import decimal
+import hashlib
 import json
 import os
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import psycopg
 from psycopg import sql
 
+from ..values import is_null
 from .base import (
     QUARANTINE_SUFFIX,
     STAGING_SUFFIX,
     check_target,
-    frame_fingerprint,
     quarantine_as_text,
     records,
     with_meta,
@@ -92,41 +93,75 @@ class PostgresSource:
         self.uri = f"postgres:{table}"
         self.name = table.split(".")[-1]
 
-    def read(self, limit: Optional[int] = None) -> pd.DataFrame:
+    def _read(self, limit: Optional[int], with_text: bool):
         with connect("SHDI_PG_DSN") as con:
             con.read_only = True
-            with con.cursor() as cur:
+            # One snapshot for the rows and their text, rendered in UTC so the
+            # fingerprint of a timestamptz does not depend on the session.
+            con.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+            with con.transaction(), con.cursor() as cur:
+                cur.execute("SET LOCAL TIME ZONE 'UTC'")
                 cur.execute(sql.SQL("SELECT * FROM {} LIMIT 0").format(_ident(self.table)))
+                desc = list(cur.description)
                 # Order by every column: deterministic, and rows that tie are identical.
-                keys = [_order_key(con, d.name, d.type_code) for d in cur.description]
-                q = sql.SQL("SELECT * FROM {} ORDER BY {}").format(_ident(self.table), sql.SQL(", ").join(keys))
-                if limit:
-                    q = q + sql.SQL(" LIMIT {}").format(sql.Literal(int(limit)))
-                cur.execute(q)
+                order = sql.SQL(", ").join(_order_key(con, d.name, d.type_code) for d in desc)
+                lim = sql.SQL(" LIMIT {}").format(sql.Literal(int(limit))) if limit else sql.SQL("")
+                cur.execute(sql.SQL("SELECT * FROM {} ORDER BY {}").format(_ident(self.table), order) + lim)
                 cols = [d.name for d in cur.description]
                 rows = cur.fetchall()
-        df = pd.DataFrame(rows, columns=cols, dtype=object)
-        return df
+                fp = None
+                if with_text:
+                    texts = sql.SQL(", ").join(sql.SQL("{}::text").format(sql.Identifier(d.name)) for d in desc)
+                    cur.execute(sql.SQL("SELECT {} FROM {} ORDER BY {}").format(texts, _ident(self.table), order))
+                    h = hashlib.sha256()
+                    names = []
+                    for d in desc:
+                        info = con.adapters.types.get(d.type_code)
+                        names.append(f"{d.name}:{info.name if info else d.type_code}")
+                    h.update(("\x1f".join(names) + "\x1e").encode())
+                    for row in cur:
+                        h.update(("\x1f".join("\x00" if v is None else v for v in row) + "\x1e").encode())
+                    fp = h.hexdigest()
+        return pd.DataFrame(rows, columns=cols, dtype=object), fp
+
+    def read(self, limit: Optional[int] = None) -> pd.DataFrame:
+        return self._read(limit, False)[0]
+
+    def snapshot(self) -> Tuple[pd.DataFrame, str]:
+        return self._read(None, True)
 
     def fingerprint(self) -> str:
-        return frame_fingerprint(self.read())
+        return self.snapshot()[1]
+
+
+def _aware(v) -> bool:
+    return isinstance(v, dt.datetime) and v.tzinfo is not None
 
 
 def _pg_type(series: pd.Series) -> str:
+    """The Postgres type for a frame column. An instant with an offset is
+    timestamptz (a plain timestamp would shift it by the session TimeZone) and
+    a Decimal is numeric (double precision would round it)."""
     d = series.dtype
+    non_null = [v for v in series.tolist() if not is_null(v)]
     if pd.api.types.is_bool_dtype(d):
         return "boolean"
-    if pd.api.types.is_integer_dtype(d):
+    if pd.api.types.is_integer_dtype(d) and all(-(2**63) <= int(v) < 2**63 for v in non_null):
         return "bigint"
     if pd.api.types.is_float_dtype(d):
         return "double precision"
-    if pd.api.types.is_datetime64_any_dtype(d):
-        return "timestamp"
-    non_null = [v for v in series.tolist() if v is not None and not (isinstance(v, float) and v != v) and v is not pd.NA]
+    if pd.api.types.is_datetime64_any_dtype(d) and any(isinstance(v, dt.datetime) for v in non_null):
+        return "timestamptz" if any(_aware(v) for v in non_null) else "timestamp"
     if non_null and all(isinstance(v, dt.date) and not isinstance(v, dt.datetime) for v in non_null):
         return "date"
     if non_null and all(isinstance(v, dt.datetime) for v in non_null):
-        return "timestamp"
+        if all(_aware(v) for v in non_null):
+            return "timestamptz"
+        return "timestamp" if not any(_aware(v) for v in non_null) else "text"
+    if non_null and all(isinstance(v, (int, decimal.Decimal)) and not isinstance(v, bool) for v in non_null) and (
+        any(isinstance(v, decimal.Decimal) for v in non_null) or any(not -(2**63) <= v < 2**63 for v in non_null)
+    ):
+        return "numeric"
     # An object column of Python values (a frame read back from Postgres) keeps
     # its type, so writing it again does not widen the sink column to text.
     if non_null and all(isinstance(v, bool) for v in non_null):
@@ -146,6 +181,7 @@ _INFO_NAME = {
     "timestamp": "timestamp without time zone",
     "timestamptz": "timestamp with time zone",
     "date": "date",
+    "numeric": "numeric",
     "text": "text",
 }
 
@@ -161,6 +197,9 @@ def _widen(existing: str, wanted: str) -> Optional[str]:
     all whole and as double precision otherwise, and both fit a double column."""
     if existing == _INFO_NAME[wanted] or existing == "text":
         return None
+    if existing in _PG_NUMERIC and wanted == "numeric":
+        # numeric holds every integer and every double exactly.
+        return "numeric"
     if existing in _PG_NUMERIC and wanted in ("bigint", "double precision"):
         if existing in ("double precision", "numeric"):
             return None
@@ -215,41 +254,62 @@ class PostgresSink:
     def __init__(self, table: str):
         self.table = table
 
-    def _write(self, df: pd.DataFrame, run_id: str, suffix: str) -> int:
+    def _write_in(self, con: psycopg.Connection, df: Optional[pd.DataFrame], run_id: str, suffix: str) -> None:
+        """Replace the run's rows in one table inside the caller's transaction;
+        `df` None only deletes them."""
         target = self.table + suffix
         check_target(target)
         ident = _ident(target)
+        if df is None:
+            if con.execute("SELECT to_regclass(%s)", [ident.as_string(con)]).fetchone()[0] is not None:
+                con.execute(sql.SQL("DELETE FROM {} WHERE shdi_run_id = %s").format(ident), [run_id])
+            return
         types = {c: _pg_type(df[c]) for c in df.columns}
         types["shdi_run_id"] = "text"
         types["shdi_applied_at"] = "timestamptz"
         types["shdi_source_row"] = "bigint"
         cols = list(df.columns)
+        con.execute(
+            sql.SQL("CREATE TABLE IF NOT EXISTS {} ({})").format(
+                ident,
+                sql.SQL(", ").join(sql.SQL("{} {}").format(sql.Identifier(c), sql.SQL(types[c])) for c in cols),
+            )
+        )
+        _sync_columns(con, target, types, {c for c in cols if df[c].isna().all()})
+        con.execute(sql.SQL("DELETE FROM {} WHERE shdi_run_id = %s").format(ident), [run_id])
+        insert = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+            ident,
+            sql.SQL(", ").join(sql.Identifier(c) for c in cols),
+            sql.SQL(", ").join(sql.Placeholder() for _ in cols),
+        )
+        with con.cursor() as cur:
+            cur.executemany(insert, [[_sink_value(r[c]) for c in cols] for r in records(df)])
+
+    def _transaction(self, steps) -> None:
         with connect("SHDI_PG_SINK_DSN", "SHDI_PG_DSN") as con:
             with con.transaction():
-                con.execute(
-                    sql.SQL("CREATE TABLE IF NOT EXISTS {} ({})").format(
-                        ident,
-                        sql.SQL(", ").join(sql.SQL("{} {}").format(sql.Identifier(c), sql.SQL(types[c])) for c in cols),
-                    )
-                )
-                _sync_columns(con, target, types, {c for c in cols if df[c].isna().all()})
-                con.execute(sql.SQL("DELETE FROM {} WHERE shdi_run_id = %s").format(ident), [run_id])
-                insert = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
-                    ident,
-                    sql.SQL(", ").join(sql.Identifier(c) for c in cols),
-                    sql.SQL(", ").join(sql.Placeholder() for _ in cols),
-                )
-                with con.cursor() as cur:
-                    cur.executemany(insert, [[_sink_value(r[c]) for c in cols] for r in records(df)])
-        return len(df)
+                for df, run_id, suffix in steps:
+                    self._write_in(con, df, run_id, suffix)
 
     def write_staging(self, df: pd.DataFrame, run_id: str) -> int:
-        return self._write(with_meta(df, run_id), run_id, STAGING_SUFFIX)
+        self._transaction([(with_meta(df, run_id), run_id, STAGING_SUFFIX)])
+        return len(df)
 
     def write_quarantine(self, df: pd.DataFrame, run_id: str) -> int:
         if df.empty:
             return 0
-        return self._write(with_meta(quarantine_as_text(df), run_id), run_id, QUARANTINE_SUFFIX)
+        self._transaction([(with_meta(quarantine_as_text(df), run_id), run_id, QUARANTINE_SUFFIX)])
+        return len(df)
+
+    def write_run(self, staging: pd.DataFrame, quarantine: pd.DataFrame, run_id: str) -> tuple:
+        """Both tables in one transaction; an empty quarantine still clears
+        rows an earlier attempt of the run left there."""
+        q = None if quarantine.empty else with_meta(quarantine_as_text(quarantine), run_id)
+        self._transaction([(with_meta(staging, run_id), run_id, STAGING_SUFFIX), (q, run_id, QUARANTINE_SUFFIX)])
+        return len(staging), len(quarantine)
+
+    def delete_run(self, run_id: str) -> None:
+        self._transaction([(None, run_id, STAGING_SUFFIX), (None, run_id, QUARANTINE_SUFFIX)])
 
     def _read(self, suffix: str, run_id: Optional[str]) -> pd.DataFrame:
         target = self.table + suffix

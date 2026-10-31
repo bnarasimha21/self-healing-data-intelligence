@@ -34,7 +34,6 @@ from .audit import AuditLog, now_iso
 from .checks import failing, parse_frame, run_checks
 from .config import checkpoint_db_path
 from .connectors import open_sink, open_source, to_csv_bytes
-from .connectors.base import frame_fingerprint
 from .contract import contract_from_dict
 from .llm import ChatModelFactory, explain_proposals, llm_mode, write_plan
 from .repairs import apply_proposals, propose_repairs
@@ -83,9 +82,14 @@ class StaleSourceError(RuntimeError):
     pass
 
 
+def _snapshot(uri: str):
+    """Rows plus the source's fingerprint. DuckDB and Postgres hash the
+    database's own text and column types, which pandas values can hide."""
+    return open_source(uri).snapshot()
+
+
 def _read_checked(state: PipelineState):
-    df = open_source(state["source_uri"]).read()
-    fp = frame_fingerprint(df)
+    df, fp = _snapshot(state["source_uri"])
     if fp != state["source_fingerprint"]:
         raise StaleSourceError(
             f"source {state['source_uri']} changed since it was loaded "
@@ -108,8 +112,7 @@ def node_plan(state: PipelineState, chat_model_factory: Optional[ChatModelFactor
 
 
 def node_load(state: PipelineState) -> Dict[str, Any]:
-    df = open_source(state["source_uri"]).read()
-    fp = frame_fingerprint(df)
+    df, fp = _snapshot(state["source_uri"])
     return {
         "source_fingerprint": fp,
         "row_count": int(len(df)),
@@ -228,17 +231,21 @@ def node_apply(state: PipelineState) -> Dict[str, Any]:
     decisions = state.get("decisions") or {}
     approved_ids = [pid for pid, d in decisions.items() if d["decision"] == "approved"]
     audit = AuditLog()
+    sink = open_sink(state["source_uri"], state.get("sink_dir"))
     try:
         df = _read_checked(state)
     except StaleSourceError as e:
+        # An earlier attempt of this run may have written staging rows before
+        # failing; nothing of a run whose source changed may stay behind.
+        sink.delete_run(run_id)
         for pid in approved_ids:
             audit.record(run_id, by_id[pid], "skipped", state["source_fingerprint"], detail=str(e))
         return {"apply": {"status": "stale_source", "error": str(e)}, "status": "stale_source", "messages": [f"Apply refused: {e}"]}
 
     result = apply_proposals(df, contract, proposals, approved_ids)
-    sink = open_sink(state["source_uri"], state.get("sink_dir"))
-    staged = sink.write_staging(result.output, run_id)
-    quarantined = sink.write_quarantine(result.quarantine, run_id)
+    # Both tables in one transaction (one lock for CSV), replacing whatever an
+    # earlier attempt of this run left in either of them.
+    staged, quarantined = sink.write_run(result.output, result.quarantine, run_id)
 
     for pid in result.applied:
         audit.record(run_id, by_id[pid], "applied", state["source_fingerprint"])
