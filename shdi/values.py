@@ -16,11 +16,17 @@ import numpy as np
 import pandas as pd
 from dateutil import parser as dateparser
 
-_NUMBER_RE = re.compile(r"^\s*[-+]?((\d+(\.\d*)?)|(\.\d+))([eE][-+]?\d+)?\s*$")
-_INT_RE = re.compile(r"^\s*[-+]?\d+\s*$")
-_YEAR_RE = re.compile(r"\d{4}")
+_NUMBER_RE = re.compile(r"^\s*[-+]?((\d+(\.\d*)?)|(\.\d+))([eE][-+]?\d+)?\s*$", re.ASCII)
+_INT_RE = re.compile(r"^\s*[-+]?\d+\s*$", re.ASCII)
+_YEAR_RE = re.compile(r"\d{4}", re.ASCII)
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_YMD_RE = re.compile(r"^\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\s*$")
+_YMD_RE = re.compile(r"^\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[T ]\S.*)?\s*$", re.ASCII)
+# Integers are stored as Int64; anything wider is not a valid integer here.
+INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
+# Two far-apart defaults: a text that parses differently under each one was
+# missing a part (year, month or day) that dateutil would fill in from them.
+_DEFAULT_A = dt.datetime(2001, 1, 1)
+_DEFAULT_B = dt.datetime(2002, 2, 2)
 _BOOL_TRUE = {"true", "t", "yes", "y", "1"}
 _BOOL_FALSE = {"false", "f", "no", "n", "0"}
 
@@ -66,25 +72,29 @@ def is_null(x: Any) -> bool:
     return bool(res) if isinstance(res, (bool, np.bool_)) else False
 
 
+def _int_in_range(n: int) -> Parsed:
+    return Parsed(n) if INT64_MIN <= n <= INT64_MAX else Parsed(INVALID)
+
+
 def parse_integer(x: Any) -> Parsed:
     if is_null(x):
         return Parsed(None)
     if isinstance(x, (bool, np.bool_)):
         return Parsed(INVALID)
     if isinstance(x, (int, np.integer)):
-        return Parsed(int(x))
+        return _int_in_range(int(x))
     if isinstance(x, (float, np.floating)):
         f = float(x)
         if math.isfinite(f) and f.is_integer():
-            return Parsed(int(f))
+            return _int_in_range(int(f))
         return Parsed(INVALID)
     s = str(x)
     if _INT_RE.match(s):
-        return Parsed(int(s.strip()))
+        return _int_in_range(int(s.strip()))
     if _NUMBER_RE.match(s):
         f = float(s)
         if math.isfinite(f) and f.is_integer():
-            return Parsed(int(f))
+            return _int_in_range(int(f))
     return Parsed(INVALID)
 
 
@@ -94,15 +104,18 @@ def parse_number(x: Any) -> Parsed:
     if isinstance(x, (bool, np.bool_)):
         return Parsed(INVALID)
     if isinstance(x, (int, np.integer)):
-        return Parsed(int(x))
+        n = int(x)
+        return Parsed(n if INT64_MIN <= n <= INT64_MAX else float(n))
     if isinstance(x, (float, np.floating)):
         f = float(x)
         if not math.isfinite(f):
             return Parsed(INVALID)
-        return Parsed(int(f) if f.is_integer() else f)
+        return Parsed(int(f) if f.is_integer() and INT64_MIN <= f <= INT64_MAX else f)
     s = str(x)
     if _INT_RE.match(s):
-        return Parsed(int(s.strip()))
+        n = int(s.strip())
+        # Numbers are stored as floats once they do not fit in an Int64.
+        return Parsed(n if INT64_MIN <= n <= INT64_MAX else float(n))
     if _NUMBER_RE.match(s):
         f = float(s)
         if not math.isfinite(f):
@@ -136,11 +149,13 @@ def parse_date(x: Any) -> Parsed:
         return Parsed(INVALID)
     try:
         if _YMD_RE.match(s):
-            d = dateparser.parse(s, yearfirst=True, dayfirst=False)
-            return Parsed(d.date())
-        month_first = dateparser.parse(s, dayfirst=False)
+            d = _complete(s, yearfirst=True, dayfirst=False)
+            return Parsed(d.date()) if d is not None else Parsed(INVALID)
+        month_first = _complete(s, dayfirst=False)
+        if month_first is None:
+            return Parsed(INVALID)
         try:
-            day_first = dateparser.parse(s, dayfirst=True)
+            day_first = _complete(s, dayfirst=True) or month_first
         except (ValueError, OverflowError):
             day_first = month_first
     except (ValueError, OverflowError):
@@ -148,20 +163,42 @@ def parse_date(x: Any) -> Parsed:
     return Parsed(month_first.date(), ambiguous=month_first.date() != day_first.date())
 
 
+def _complete(s: str, **kw) -> Optional[dt.datetime]:
+    """Parse with dateutil, or None when the text lacks a year, month or day.
+
+    dateutil fills missing parts from a default (today, unless told otherwise),
+    so "2024" would become a different date every day. Parsing with two
+    different defaults exposes that: a complete date gives the same answer."""
+    a = dateparser.parse(s, default=_DEFAULT_A, **kw)
+    b = dateparser.parse(s, default=_DEFAULT_B, **kw)
+    if (a.year, a.month, a.day) != (b.year, b.month, b.day):
+        return None
+    return a
+
+
+def _naive_utc(d: dt.datetime) -> dt.datetime:
+    """Timestamps with an offset are converted to UTC and stored without one,
+    so aware and naive values in one column compare and store together."""
+    if d.tzinfo is None:
+        return d
+    return d.astimezone(dt.timezone.utc).replace(tzinfo=None)
+
+
 def parse_timestamp(x: Any) -> Parsed:
     if is_null(x):
         return Parsed(None)
     if isinstance(x, (pd.Timestamp, dt.datetime)):
-        return Parsed(pd.Timestamp(x).to_pydatetime())
+        return Parsed(_naive_utc(pd.Timestamp(x).to_pydatetime()))
     if isinstance(x, dt.date):
         return Parsed(dt.datetime(x.year, x.month, x.day))
     s = str(x).strip()
     if not s or not _YEAR_RE.search(s):
         return Parsed(INVALID)
     try:
-        return Parsed(dateparser.parse(s))
+        d = _complete(s)
     except (ValueError, OverflowError):
         return Parsed(INVALID)
+    return Parsed(_naive_utc(d)) if d is not None else Parsed(INVALID)
 
 
 def parse_boolean(x: Any) -> Parsed:

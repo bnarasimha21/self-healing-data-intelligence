@@ -291,7 +291,7 @@ def apply_proposals(
     removed: Dict[int, Dict[str, Any]] = {}
     applied: List[str] = []
     skipped: List[Dict[str, str]] = []
-    cells_changed = 0
+    changed_cells: Set[tuple] = set()  # (row, column); a cell fixed and cast counts once
     quarantine_rows: List[Dict[str, Any]] = []
 
     for p in props:
@@ -312,7 +312,7 @@ def apply_proposals(
             columns[p["column"]] = [p["new_values"][0]] * n
             dtypes[p["column"]] = None
             applied.append(p["id"])
-            cells_changed += n
+            changed_cells.update((r, p["column"]) for r in range(n) if r not in removed)
 
     def store(column: str, value: Any) -> Any:
         dtype = dtypes.get(column)
@@ -336,7 +336,7 @@ def apply_proposals(
             continue
         columns[col][r] = store(col, p["new_values"][0])
         applied.append(p["id"])
-        cells_changed += 1
+        changed_cells.add((r, col))
 
     keep = [r for r in range(n) if r not in removed]
     out = pd.DataFrame({c: [columns[c][r] for r in keep] for c in columns}, index=keep)
@@ -359,7 +359,7 @@ def apply_proposals(
             continue
         out[name] = _typed_column([x.value for x in parsed], type_).set_axis(out.index)
         applied.append(p["id"])
-        cells_changed += sum(1 for r in p["rows"] if r not in removed)
+        changed_cells.update((r, name) for r in p["rows"] if r not in removed)
 
     quarantine = pd.DataFrame(quarantine_rows)
     return ApplyResult(
@@ -367,7 +367,7 @@ def apply_proposals(
         quarantine=quarantine,
         applied=applied,
         skipped=skipped,
-        cells_changed=cells_changed,
+        cells_changed=len(changed_cells),
         rows_dropped=sum(1 for p in removed.values() if p["rule"] == "drop_duplicate"),
         rows_quarantined=len(quarantine_rows),
     )

@@ -82,14 +82,36 @@ class Column(BaseModel):
             raise ValueError(f"unknown check kinds {unknown}; known: {list(CHECK_KINDS)}")
         return v
 
+    @field_validator("min", "max", mode="before")
+    @classmethod
+    def _yaml_dates(cls, v: Any) -> Any:
+        # An unquoted 1970-01-01 in YAML arrives as a date object.
+        if isinstance(v, (dt.date, dt.datetime)):
+            return v.isoformat()
+        return v
+
+    @field_validator("unit_factors")
+    @classmethod
+    def _positive_factors(cls, v: List[float]) -> List[float]:
+        bad = [f for f in v if not f > 0 or f == 1]
+        if bad:
+            raise ValueError(f"unit_factors must be positive and not 1, got {bad}")
+        return v
+
     @model_validator(mode="after")
     def _bounds_match_type(self) -> "Column":
+        from .values import INVALID, parse
+
         for name in ("min", "max"):
             bound = getattr(self, name)
             if bound is None:
                 continue
-            if self.type in ("integer", "number") and not isinstance(bound, (int, float)):
+            if self.type in ("string", "boolean"):
+                raise ValueError(f"{name} does not apply to a {self.type} column")
+            if self.type in ("integer", "number") and (isinstance(bound, bool) or not isinstance(bound, (int, float))):
                 raise ValueError(f"{name} must be a number for a {self.type} column")
+            if self.type == "integer" and not float(bound).is_integer():
+                raise ValueError(f"{name} must be a whole number for an integer column")
             if self.type in ("date", "timestamp"):
                 if bound != "today":
                     try:
@@ -100,6 +122,11 @@ class Column(BaseModel):
             raise ValueError("measure: true only applies to integer or number columns")
         if self.unit_factors and self.type not in ("integer", "number"):
             raise ValueError("unit_factors only applies to integer or number columns")
+        if self.default is not None:
+            if parse(self.default, self.type).value is INVALID:
+                raise ValueError(f"default {self.default!r} is not a valid {self.type}")
+            if self.accepted_values is not None and self.default not in self.accepted_values:
+                raise ValueError(f"default {self.default!r} is not in accepted_values")
         return self
 
 
@@ -174,7 +201,10 @@ class Contract(BaseModel):
 
 def load_contract(path: Union[str, Path]) -> Contract:
     p = Path(path)
-    data = yaml.safe_load(p.read_text())
+    try:
+        data = yaml.safe_load(p.read_text())
+    except yaml.YAMLError as e:
+        raise ValueError(f"contract {p} is not valid YAML: {e}") from None
     if not isinstance(data, dict):
         raise ValueError(f"contract {p} is not a YAML mapping")
     return Contract.model_validate(data)
