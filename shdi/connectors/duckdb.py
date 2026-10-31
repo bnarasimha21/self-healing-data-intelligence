@@ -66,14 +66,24 @@ class DuckDBSource:
 
 
 _INTEGER_TYPES = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT"}
+_WIDE_INTEGERS = {"BIGINT", "HUGEINT", "UBIGINT"}
+_FLOAT_TYPES = {"FLOAT", "DOUBLE"}
 
 
 def _widen(existing: str, wanted: str) -> Optional[str]:
-    """The type to change an existing sink column to, or None to leave it."""
+    """The type to change an existing sink column to, or None to leave it.
+
+    Never narrows: a number column arrives as BIGINT in a run whose values
+    are all whole and as DOUBLE otherwise, and both fit a DOUBLE column."""
     if wanted == "NULL" or existing == wanted or existing == "VARCHAR":
         return None
-    if existing in _INTEGER_TYPES and wanted in _INTEGER_TYPES | {"DOUBLE", "FLOAT"}:
-        return "DOUBLE" if wanted in ("DOUBLE", "FLOAT") else "BIGINT"
+    numeric = _INTEGER_TYPES | _FLOAT_TYPES
+    if existing in numeric and wanted in numeric:
+        if existing == "DOUBLE":
+            return None
+        if wanted in _FLOAT_TYPES or existing == "FLOAT":
+            return "DOUBLE"
+        return None if existing in _WIDE_INTEGERS else "BIGINT"
     return "VARCHAR"
 
 
@@ -104,11 +114,14 @@ class DuckDBSink:
             cols = ", ".join(f"{quote_ident(c)} {'VARCHAR' if t == 'NULL' else t}" for c, t in wanted)
             con.execute(f"CREATE TABLE IF NOT EXISTS {qt} ({cols})")
             existing = _table_types(con, target)
+            # A column that is entirely null in this run says nothing about its
+            # type, so it never changes an existing column.
+            all_null = {c for c in df.columns if df[c].isna().all()}
             for c, t in wanted:
                 if c not in existing:
                     con.execute(f"ALTER TABLE {qt} ADD COLUMN {quote_ident(c)} {'VARCHAR' if t == 'NULL' else t}")
                     continue
-                new = _widen(existing[c], t)
+                new = None if c in all_null else _widen(existing[c], t)
                 if new:
                     con.execute(f"ALTER TABLE {qt} ALTER COLUMN {quote_ident(c)} TYPE {new}")
             con.execute(f"DELETE FROM {qt} WHERE shdi_run_id = ?", [run_id])

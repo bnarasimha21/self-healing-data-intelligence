@@ -228,6 +228,32 @@ def test_duckdb_sink_schema_widens_across_runs(tmp_path):
     assert by_run["r3"]["amt"] == "abc"
 
 
+def number_runs():
+    """A number column arrives as Int64 when every value is whole, Float64 otherwise;
+    a run where a column is all null carries no type for it."""
+    return [
+        ("r1", pd.DataFrame({"id": [1, 2], "amt": pd.array([1.5, 2.0], dtype="Float64"),
+                             "day": [dt.date(2024, 1, 1), dt.date(2024, 1, 2)]})),
+        ("r2", pd.DataFrame({"id": [3, 4], "amt": pd.array([3, 4], dtype="Int64"),
+                             "day": pd.Series([None, None], dtype=object)})),
+        ("r3", pd.DataFrame({"id": [5], "amt": pd.array([None], dtype="Float64"),
+                             "day": pd.Series([float("nan")])})),
+    ]
+
+
+def test_duckdb_sink_never_narrows_or_textifies_numbers_and_dates(tmp_path):
+    db = tmp_path / "x.duckdb"
+    sink = DuckDBSink(str(db), "sales")
+    for run, frame in number_runs():
+        sink.write_staging(frame, run)
+    con = duckdb.connect(str(db), read_only=True)
+    types = dict(con.execute("SELECT column_name, data_type FROM information_schema.columns "
+                             "WHERE table_name = 'sales__shdi_staging'").fetchall())
+    con.close()
+    assert types["amt"] == "DOUBLE" and types["day"] == "DATE", types
+    assert sorted(float(v) for v in sink.read_staging()["amt"].dropna()) == [1.5, 2.0, 3.0, 4.0]
+
+
 # CLI exit codes
 
 
@@ -315,6 +341,37 @@ def test_postgres_sink_widens_and_handles_odd_names():
     finally:
         with psycopg.connect(writer, autocommit=True) as con:
             con.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pg
+def test_postgres_sink_never_narrows_or_textifies_numbers_and_dates():
+    import psycopg
+    from psycopg import sql
+
+    from shdi.connectors.postgres import PostgresSink
+
+    writer = os.environ.get("SHDI_PG_SINK_DSN") or os.environ["SHDI_PG_DSN"]
+    schema = f"shdi_h_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(writer, autocommit=True) as con:
+        con.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    try:
+        sink = PostgresSink(f"{schema}.sales")
+        for run, frame in number_runs():
+            sink.write_staging(frame, run)
+        with psycopg.connect(writer) as con:
+            types = dict(con.execute(
+                "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = %s "
+                "AND table_name = 'sales__shdi_staging'", [schema]).fetchall())
+        assert types["amt"] == "double precision" and types["day"] == "date", types
+    finally:
+        with psycopg.connect(writer, autocommit=True) as con:
+            con.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+def test_postgres_name_too_long_for_the_suffix_is_refused_up_front():
+    parse_uri(f"postgres:public.{'t' * 46}")  # 46 + len("__shdi_quarantine") == 63
+    with pytest.raises(SourceURIError, match="too long"):
+        parse_uri(f"postgres:public.{'t' * 47}")
 
 
 @pg

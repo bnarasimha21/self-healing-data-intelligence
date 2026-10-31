@@ -150,16 +150,27 @@ _INFO_NAME = {
 }
 
 
+_PG_INTEGERS = {"smallint", "integer", "bigint"}
+_PG_NUMERIC = _PG_INTEGERS | {"real", "double precision", "numeric"}
+
+
 def _widen(existing: str, wanted: str) -> Optional[str]:
-    """The type to change an existing sink column to, or None to leave it."""
+    """The type to change an existing sink column to, or None to leave it.
+
+    Never narrows: a number column arrives as bigint in a run whose values are
+    all whole and as double precision otherwise, and both fit a double column."""
     if existing == _INFO_NAME[wanted] or existing == "text":
         return None
-    if existing == "bigint" and wanted == "double precision":
-        return "double precision"
+    if existing in _PG_NUMERIC and wanted in ("bigint", "double precision"):
+        if existing in ("double precision", "numeric"):
+            return None
+        if wanted == "double precision" or existing == "real":
+            return "double precision"
+        return None if existing == "bigint" else "bigint"
     return "text"
 
 
-def _sync_columns(con: psycopg.Connection, table: str, types: dict) -> None:
+def _sync_columns(con: psycopg.Connection, table: str, types: dict, all_null: set) -> None:
     """Make an existing sink table able to take this frame: add missing columns,
     widen columns whose type no longer fits (bigint to double, anything else to text)."""
     parts = _parts(table)
@@ -177,7 +188,8 @@ def _sync_columns(con: psycopg.Connection, table: str, types: dict) -> None:
         if col not in existing:
             con.execute(sql.SQL("ALTER TABLE {} ADD COLUMN {} {}").format(ident, sql.Identifier(col), sql.SQL(wanted)))
             continue
-        new = _widen(existing[col], wanted)
+        # A column that is entirely null in this run says nothing about its type.
+        new = None if col in all_null else _widen(existing[col], wanted)
         if new:
             con.execute(
                 sql.SQL("ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{}").format(
@@ -220,7 +232,7 @@ class PostgresSink:
                         sql.SQL(", ").join(sql.SQL("{} {}").format(sql.Identifier(c), sql.SQL(types[c])) for c in cols),
                     )
                 )
-                _sync_columns(con, target, types)
+                _sync_columns(con, target, types, {c for c in cols if df[c].isna().all()})
                 con.execute(sql.SQL("DELETE FROM {} WHERE shdi_run_id = %s").format(ident), [run_id])
                 insert = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
                     ident,

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from ..config import sink_dir
-from .base import Sink, Source, frame_fingerprint, to_csv_bytes  # noqa: F401
+from .base import QUARANTINE_SUFFIX, STAGING_SUFFIX, Sink, Source, frame_fingerprint, to_csv_bytes  # noqa: F401
 
 
 class SourceURIError(ValueError):
@@ -45,7 +45,15 @@ def parse_uri(uri: str) -> Tuple[str, str, Optional[str]]:
         table = u[len("postgres:"):]
         if not table:
             raise SourceURIError("postgres URI needs a table: postgres:<schema>.<table>")
-        return "postgres", "", check_table_name(table)
+        check_table_name(table)
+        # Postgres truncates names over 63 bytes; refuse here, not after a reviewer approved.
+        longest = max(len(STAGING_SUFFIX), len(QUARANTINE_SUFFIX))
+        if len(table.split(".")[-1]) + longest > 63 or len(table.split(".")[0]) > 63:
+            raise SourceURIError(
+                f"table name {table!r} is too long: with the {QUARANTINE_SUFFIX} suffix it would pass "
+                "Postgres's 63-byte limit"
+            )
+        return "postgres", "", table
     if u.startswith("duckdb:"):
         rest = u[len("duckdb:"):]
         if rest.startswith("//"):
