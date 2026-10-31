@@ -147,15 +147,22 @@ def parse_number(x: Any) -> Parsed:
         # (Fraction, int) would also build numbers of that many digits.
         if not exact.is_finite() or (exact and abs(exact.adjusted()) > 1000):
             return Parsed(INVALID)
+        integral = exact == exact.to_integral_value()
+        # Whole numbers a double holds exactly ("5.0", "1E5", "100.00", "-0e0")
+        # are ints, as parse_number(5.0) is, so they stage as integers and -0
+        # is 0. adjusted() first, never int() of 1e999.
+        if integral and (not exact or exact.adjusted() <= 15) and abs(int(exact)) <= FLOAT_EXACT_INT:
+            return Parsed(int(exact))
         f = float(exact)
         # Text a float prints as exactly ("0.1", "1e+17", "2.5e+20") is that
-        # float, so the sink's own output reads back as canonical.
+        # float, so the sink's own output reads back as canonical. Checks
+        # compare through value_key, so a float past 2**53 is still told apart
+        # from the integers next to it.
         if math.isfinite(f) and Decimal(repr(f)) == exact:
             return Parsed(f)
         # Otherwise exact: "9007199254740993.0" is that integer, and
         # "123456789012345678.5" or "1e-400" (a float underflow) stay Decimal.
-        # adjusted() first, never int() of 1e999.
-        if exact == exact.to_integral_value() and exact.adjusted() <= 18 and INT64_MIN <= int(exact) <= INT64_MAX:
+        if integral and exact.adjusted() <= 18 and INT64_MIN <= int(exact) <= INT64_MAX:
             return Parsed(int(exact))
         return Parsed(exact)
     return Parsed(INVALID)
@@ -176,6 +183,19 @@ def number_key(v: Any) -> Optional[Fraction]:
     if isinstance(v, Decimal):
         return Fraction(v) if v.is_finite() else None
     return None
+
+
+def value_key(v: Any, type_: Optional[str]) -> Any:
+    """What checks compare, hash and order a parsed value by. Numbers go
+    through number_key, so the float 1.152921504606847e+18 and the int
+    1152921504606846976 are different values (as same_value says), and
+    0.1 equals Decimal('0.1'); == and < on the raw values would use the
+    float's binary value instead. Other types compare as they are."""
+    if type_ in ("integer", "number") and v is not None and v is not INVALID:
+        k = number_key(v)
+        if k is not None:
+            return k
+    return v
 
 
 def exact_number(q: Fraction) -> Optional[Any]:

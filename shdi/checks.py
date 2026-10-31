@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from .contract import Contract, resolve_bound
-from .values import INVALID, Parsed, is_canonical, parse, raw_text, to_jsonable
+from .values import INVALID, Parsed, is_canonical, parse, raw_text, to_jsonable, value_key
 
 
 @dataclass
@@ -146,7 +146,7 @@ def run_checks(
             groups: Dict[Any, List[int]] = defaultdict(list)
             for i, p in enumerate(values):
                 if p.value is not None and p.value is not INVALID:
-                    groups[p.value].append(i)
+                    groups[value_key(p.value, col.type)].append(i)
             dup = [i for rows in groups.values() if len(rows) > 1 for i in rows]
             add("unique", f"unique:{name}", name, dup, f"{len(dup)} rows share a value" if dup else "")
 
@@ -155,17 +155,22 @@ def run_checks(
             if bound is None:
                 continue
             bad = []
+            bkey = value_key(bound, col.type)
             for i, p in enumerate(values):
                 v = p.value
                 if v is None or v is INVALID:
                     continue
-                if (kind == "min" and v < bound) or (kind == "max" and v > bound):
+                v = value_key(v, col.type)
+                if (kind == "min" and v < bkey) or (kind == "max" and v > bkey):
                     bad.append(i)
             add(kind, f"{kind}:{name}", name, bad, f"{len(bad)} values {'below' if kind == 'min' else 'above'} {bound}" if bad else "")
 
         if col.accepted_values is not None:
-            accepted = {parse(a, col.type).value for a in col.accepted_values}
-            bad = [i for i, p in enumerate(values) if p.value is not None and p.value is not INVALID and p.value not in accepted]
+            accepted = {value_key(parse(a, col.type).value, col.type) for a in col.accepted_values}
+            bad = [
+                i for i, p in enumerate(values)
+                if p.value is not None and p.value is not INVALID and value_key(p.value, col.type) not in accepted
+            ]
             add("accepted_values", f"accepted_values:{name}", name, bad, f"{len(bad)} values outside accepted_values" if bad else "")
 
         if col.pattern is not None:
@@ -176,7 +181,7 @@ def run_checks(
     if contract.primary_key and all(c in df.columns for c in contract.primary_key):
         groups = defaultdict(list)
         for i in range(n):
-            key = tuple(parsed[c][i].value for c in contract.primary_key)
+            key = tuple(value_key(parsed[c][i].value, _type_of(contract, c)) for c in contract.primary_key)
             if any(k is None or k is INVALID for k in key):
                 continue
             groups[key].append(i)
@@ -194,3 +199,8 @@ def run_checks(
 
 def failing(results: List[Dict[str, Any]], severity: Optional[str] = None) -> List[Dict[str, Any]]:
     return [r for r in results if not r["passed"] and (severity is None or r["severity"] == severity)]
+
+
+def _type_of(contract: Contract, column: str) -> Optional[str]:
+    col = contract.columns.get(column)
+    return col.type if col is not None else None

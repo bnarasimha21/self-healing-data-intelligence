@@ -579,3 +579,90 @@ def test_r3_r4_postgres_numeric_columns_take_floats_exactly(monkeypatch):
     finally:
         with psycopg.connect(writer, autocommit=True) as con:
             con.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+# Third round. R8: big exponent text parsed to a float that the checks compared
+# by its binary value, so 1.152921504606847e+18 equalled 2**60.
+
+
+def _checks(values, **column):
+    from shdi.checks import run_checks
+    from shdi.contract import contract_from_dict
+
+    df = pd.DataFrame({"id": [str(i + 1) for i in range(len(values))], "n": values}, dtype=object)
+    c = contract_from_dict(contract(n={"type": "number", **column}))
+    return {x.check_id: x for x in run_checks(df, c, AS_OF)}
+
+
+def test_r8_unique_tells_big_exponent_text_from_the_integer_next_to_it():
+    assert _checks(["1152921504606846976", "1.152921504606847e+18"], unique=True)["unique:n"].passed
+    # The same value written two ways is a duplicate.
+    dup = _checks(["1152921504606847000", "1.152921504606847e+18"], unique=True)["unique:n"]
+    assert not dup.passed and dup.failing_rows == [0, 1]
+
+
+def test_r8_max_compares_big_exponent_text_exactly():
+    got = _checks(["1152921504606846976", "1.152921504606847e+18"], max=1152921504606846999)["max:n"]
+    assert got.failing_rows == [1]
+    assert _checks(["1.152921504606847e+18"], min=1152921504606847001)["min:n"].failing_rows == [0]
+
+
+def test_r8_accepted_values_match_by_exact_value():
+    got = _checks(["1152921504606847000", "1152921504606846976", "0.1"],
+                  accepted_values=["1.152921504606847e+18", "0.10"])["accepted_values:n"]
+    assert got.failing_rows == [1]
+
+
+def test_r8_primary_key_on_big_exponent_text():
+    from shdi.checks import run_checks
+    from shdi.contract import contract_from_dict
+
+    c = contract_from_dict({"name": "t", "primary_key": ["k"],
+                            "columns": {"k": {"type": "number", "nullable": False}, "v": {"type": "string"}}})
+    distinct = pd.DataFrame({"k": ["1152921504606846976", "1.152921504606847e+18"], "v": ["a", "b"]}, dtype=object)
+    same = pd.DataFrame({"k": ["1152921504606847000", "1.152921504606847e+18"], "v": ["a", "b"]}, dtype=object)
+    assert {x.check_id: x for x in run_checks(distinct, c, AS_OF)}["primary_key:k"].passed
+    assert {x.check_id: x for x in run_checks(same, c, AS_OF)}["primary_key:k"].failing_rows == [0, 1]
+
+
+# R9: whole-number text parsed to float, so the column staged as DOUBLE and -0e0 was -0.0.
+
+
+@pytest.mark.parametrize("text,want", [("5.0", 5), ("1E5", 100000), ("100.00", 100), ("-0e0", 0), ("-0.0", 0)])
+def test_r9_whole_number_text_is_an_int(text, want):
+    from shdi.values import parse_number
+
+    got = parse_number(text).value
+    assert got == want and type(got) is int, repr(got)
+
+
+def test_r9_whole_number_text_stages_as_an_integer_column(tmp_path):
+    db = tmp_path / "w.duckdb"
+    make_duckdb(db, "id INTEGER, n VARCHAR", [(1, "5.0"), (2, "1E5"), (3, "-0e0")])
+    out = workflow.start_run(f"duckdb://{db}#t", contract(n={"type": "number"}), run_id="r9",
+                             auto_approve=True, graph=graph(tmp_path), as_of=AS_OF)
+    assert out["status"] == "completed", out
+    con = duckdb.connect(str(db), read_only=True)
+    try:
+        types = {r[0]: r[1] for r in con.execute('DESCRIBE "t__shdi_staging"').fetchall()}
+        vals = [r[0] for r in con.execute('SELECT n FROM "t__shdi_staging" ORDER BY id').fetchall()]
+    finally:
+        con.close()
+    assert types["n"] == "BIGINT" and vals == [5, 100000, 0]
+
+
+# R10: exactly 2**53 fits a DOUBLE and must not force VARCHAR.
+
+
+def test_r10_two_to_the_53_still_widens_to_double(tmp_path):
+    db = tmp_path / "w.duckdb"
+    make_duckdb(db, "x INTEGER", [])
+    sink = DuckDBSink(str(db), "t")
+    sink.write_run(pd.DataFrame({"x": [2**53]}), pd.DataFrame(), "a")
+    sink.write_run(pd.DataFrame({"x": [1.5]}), pd.DataFrame(), "b")
+    con = duckdb.connect(str(db), read_only=True)
+    try:
+        types = {r[0]: r[1] for r in con.execute('DESCRIBE "t__shdi_staging"').fetchall()}
+    finally:
+        con.close()
+    assert types["x"] == "DOUBLE"

@@ -46,6 +46,7 @@ from .values import (
     is_canonical,
     is_null,
     number_key,
+    value_key,
     is_nan,
     number_text,
     parse,
@@ -162,7 +163,8 @@ def propose_repairs(
             for r in c.failing_rows:
                 if r in dup_rows:
                     continue
-                groups[tuple(parsed[k][r].value for k in contract.primary_key)].append(r)
+                groups[tuple(value_key(parsed[k][r].value, contract.columns[k].type if k in contract.columns else None)
+                             for k in contract.primary_key)].append(r)
             for key, rows in groups.items():
                 if len(rows) > 1:
                     for r in rows:
@@ -207,7 +209,7 @@ def propose_repairs(
                             # Exact arithmetic: 12345 / 1000 is 12.345, which an
                             # integer column cannot hold, so that factor is skipped.
                             q = number_key(value) / _factor(f)
-                            if (lo is not None and q < lo) or (hi is not None and q > hi):
+                            if (lo is not None and q < number_key(lo)) or (hi is not None and q > number_key(hi)):
                                 continue
                             if col.type == "integer" and q.denominator != 1:
                                 continue
