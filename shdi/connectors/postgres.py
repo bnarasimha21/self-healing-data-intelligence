@@ -12,15 +12,17 @@ import datetime as dt
 import decimal
 import hashlib
 import json
+import math
 import os
 import uuid
 from typing import List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import psycopg
 from psycopg import sql
 
-from ..values import is_null
+from ..values import FLOAT_EXACT_INT, is_null
 from .base import (
     QUARANTINE_SUFFIX,
     STAGING_SUFFIX,
@@ -168,7 +170,13 @@ def _pg_type(series: pd.Series) -> str:
         return "boolean"
     if non_null and all(isinstance(v, int) and not isinstance(v, bool) for v in non_null):
         return "bigint"
-    if non_null and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in non_null):
+    if non_null and all(isinstance(v, (int, float, decimal.Decimal)) and not isinstance(v, bool) for v in non_null):
+        # A float next to a Decimal (a clamp in a numeric column), or next to
+        # an integer a double cannot hold, needs numeric to keep every value.
+        if any(isinstance(v, decimal.Decimal) for v in non_null) or any(
+            isinstance(v, int) and abs(v) > FLOAT_EXACT_INT for v in non_null
+        ):
+            return "numeric"
         return "double precision"
     return "text"
 
@@ -209,9 +217,27 @@ def _widen(existing: str, wanted: str) -> Optional[str]:
     return "text"
 
 
-def _sync_columns(con: psycopg.Connection, table: str, types: dict, all_null: set) -> None:
+def _exact_widen(con: psycopg.Connection, ident, col: str, existing: str, wanted: str, new: Optional[str],
+                 frame_big: bool) -> Optional[str]:
+    """A double holds every integer only up to 2**53. Where integers meet
+    floats, a larger integer already in the table or in this frame makes the
+    column numeric instead, so nothing staged is rounded."""
+    if existing in _PG_INTEGERS and new == "double precision":
+        big = con.execute(
+            sql.SQL("SELECT count(*) FROM {} WHERE abs({}::numeric) > %s").format(ident, sql.Identifier(col)),
+            [FLOAT_EXACT_INT],
+        ).fetchone()[0]
+        return "numeric" if big or frame_big else new
+    if existing in ("double precision", "real") and wanted == "bigint" and frame_big:
+        return "numeric"
+    return new
+
+
+def _sync_columns(con: psycopg.Connection, table: str, types: dict, all_null: set, big_ints: set) -> dict:
     """Make an existing sink table able to take this frame: add missing columns,
-    widen columns whose type no longer fits (bigint to double, anything else to text)."""
+    widen columns whose type no longer fits (bigint to double, or numeric when
+    an integer is past 2**53; anything else to text). Returns the column types
+    (information_schema names) the table has afterwards."""
     parts = _parts(table)
     schema = parts[0] if len(parts) == 2 else None
     q = "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = %s"
@@ -223,26 +249,37 @@ def _sync_columns(con: psycopg.Connection, table: str, types: dict, all_null: se
         q += " AND table_schema = current_schema()"
     existing = dict(con.execute(q, args).fetchall())
     ident = _ident(table)
+    final = dict(existing)
     for col, wanted in types.items():
         if col not in existing:
             con.execute(sql.SQL("ALTER TABLE {} ADD COLUMN {} {}").format(ident, sql.Identifier(col), sql.SQL(wanted)))
+            final[col] = _INFO_NAME[wanted]
             continue
         # A column that is entirely null in this run says nothing about its type.
         new = None if col in all_null else _widen(existing[col], wanted)
+        new = _exact_widen(con, ident, col, existing[col], wanted, new, col in big_ints)
         if new:
+            # Through text: a double's text is its exact shortest form, while a
+            # direct double to numeric cast keeps only 15 digits.
+            via = sql.SQL("{}::text::{}") if new == "numeric" else sql.SQL("{}::{}")
             con.execute(
-                sql.SQL("ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{}").format(
-                    ident, sql.Identifier(col), sql.SQL(new), sql.Identifier(col), sql.SQL(new)
-                )
+                sql.SQL("ALTER TABLE {} ALTER COLUMN {} TYPE {} USING ").format(ident, sql.Identifier(col), sql.SQL(new))
+                + via.format(sql.Identifier(col), sql.SQL(new))
             )
+            final[col] = _INFO_NAME.get(new, new)
+    return final
 
 
 _PLAIN = (str, bool, int, float, decimal.Decimal, dt.date, dt.time, dt.timedelta, uuid.UUID, bytes)
 
 
-def _sink_value(v):
+def _sink_value(v, numeric: bool = False):
     """A value psycopg can bind. Source columns outside the contract keep their
-    Python value (a dict from a json column, say), which has no adapter."""
+    Python value (a dict from a json column, say), which has no adapter. A
+    float bound for a numeric column goes as the decimal it prints as:
+    Postgres turns a float8 parameter into numeric with only 15 digits."""
+    if numeric and isinstance(v, float) and math.isfinite(v):
+        return decimal.Decimal(repr(v))
     if v is None or isinstance(v, _PLAIN):
         return v
     if isinstance(v, (dict, list)):
@@ -275,7 +312,14 @@ class PostgresSink:
                 sql.SQL(", ").join(sql.SQL("{} {}").format(sql.Identifier(c), sql.SQL(types[c])) for c in cols),
             )
         )
-        _sync_columns(con, target, types, {c for c in cols if df[c].isna().all()})
+        big_ints = {
+            c for c in cols
+            if types[c] in ("bigint", "double precision", "numeric")
+            and any(isinstance(v, (int, np.integer)) and not isinstance(v, bool) and abs(int(v)) > FLOAT_EXACT_INT
+                    for v in df[c].tolist())
+        }
+        final = _sync_columns(con, target, types, {c for c in cols if df[c].isna().all()}, big_ints)
+        numeric = [final.get(c) == "numeric" for c in cols]
         con.execute(sql.SQL("DELETE FROM {} WHERE shdi_run_id = %s").format(ident), [run_id])
         insert = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
             ident,
@@ -283,11 +327,14 @@ class PostgresSink:
             sql.SQL(", ").join(sql.Placeholder() for _ in cols),
         )
         with con.cursor() as cur:
-            cur.executemany(insert, [[_sink_value(r[c]) for c in cols] for r in records(df)])
+            cur.executemany(insert, [[_sink_value(r[c], n) for c, n in zip(cols, numeric)] for r in records(df)])
 
     def _transaction(self, steps) -> None:
         with connect("SHDI_PG_SINK_DSN", "SHDI_PG_DSN") as con:
             with con.transaction():
+                # UTC, so widening a timestamptz column to text renders every
+                # row the same way whatever the role's or server's zone.
+                con.execute("SET LOCAL TIME ZONE 'UTC'")
                 for df, run_id, suffix in steps:
                     self._write_in(con, df, run_id, suffix)
 

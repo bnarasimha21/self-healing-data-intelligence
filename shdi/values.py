@@ -108,9 +108,12 @@ def parse_integer(x: Any) -> Parsed:
     if _INT_RE.match(s):
         return _int_in_range(int(s.strip()))
     if _NUMBER_RE.match(s):
-        f = float(s)
-        if math.isfinite(f) and f.is_integer():
-            return _int_in_range(int(f))
+        # Exact, not through a float: "1000000000000000000.5" is not an
+        # integer, and "9007199254740993.0" is 9007199254740993.
+        d = Decimal(s.strip())
+        # adjusted() first: int() of 1e999999999 would build a huge integer.
+        if d.is_finite() and (not d or d.adjusted() <= 19) and d == d.to_integral_value():
+            return _int_in_range(int(d))
     return Parsed(INVALID)
 
 
@@ -139,12 +142,21 @@ def parse_number(x: Any) -> Parsed:
         n = int(s.strip())
         return Parsed(n if INT64_MIN <= n <= INT64_MAX else Decimal(n))
     if _NUMBER_RE.match(s):
-        f = float(s)
-        if not math.isfinite(f):
-            return Parsed(INVALID)
         exact = Decimal(s.strip())
-        # "0.1" reads back as the float 0.1; "123456789012345678.5" does not.
-        return Parsed(f if Decimal(repr(f)) == exact else exact)
+        # An exponent beyond +-1000 is not data; exact arithmetic on it
+        # (Fraction, int) would also build numbers of that many digits.
+        if not exact.is_finite() or (exact and abs(exact.adjusted()) > 1000):
+            return Parsed(INVALID)
+        if exact == exact.to_integral_value():
+            # "1e5" is the integer 100000, as the float 100000.0 is. Past
+            # Int64 it stays Decimal, never int() of 1e999999999.
+            if not exact or (exact.adjusted() <= 18 and INT64_MIN <= int(exact) <= INT64_MAX):
+                return Parsed(int(exact))
+            return Parsed(exact)
+        f = float(exact)
+        # "0.1" reads back as the float 0.1; "123456789012345678.5" does not,
+        # and "1e-400" underflows a float, so both stay Decimal.
+        return Parsed(f if math.isfinite(f) and f != 0.0 and Decimal(repr(f)) == exact else exact)
     return Parsed(INVALID)
 
 

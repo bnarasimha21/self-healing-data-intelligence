@@ -478,6 +478,14 @@ def apply_proposals(
             added.add(p["column"])
             applied.append(p["id"])
 
+    def _holds_aware(column: str) -> bool:
+        tz = getattr(dtypes.get(column), "tz", None) or getattr(getattr(dtypes.get(column), "pyarrow_dtype", None), "tz", None)
+        return bool(tz) or any(
+            isinstance(v, dt.datetime) and v.tzinfo is not None for v in columns[column] if not is_null(v)
+        )
+
+    aware_columns = {c for c in columns if c not in text_columns and _holds_aware(c)}
+
     def store(column: str, value: Any) -> Any:
         if value is None:
             return None
@@ -488,7 +496,13 @@ def apply_proposals(
         if type_ is None:
             return value
         v = parse(value, type_).value
-        return value if v is INVALID else v
+        if v is INVALID:
+            return value
+        if column in aware_columns and isinstance(v, dt.datetime) and v.tzinfo is None:
+            # Timestamps parse to naive UTC; next to aware values (a timestamptz
+            # column) the fix must be aware too, or the column mixes kinds.
+            return v.replace(tzinfo=dt.timezone.utc)
+        return v
 
     applied_cells: List[tuple] = []
     for p in props:

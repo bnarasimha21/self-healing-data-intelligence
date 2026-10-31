@@ -158,9 +158,10 @@ DuckDB DOUBLE column stays NaN; it is not turned into null. Before writing,
 99.5 in a BIGINT column widens the column rather than storing 99, and the
 write is refused if a cell would still differ.
 
-A CSV whose header repeats a column name, or with a row that has more fields
-than the header, is rejected with an error instead of being read with columns
-shifted.
+A CSV whose header repeats a column name, with a row that has more fields than
+the header (a trailing comma counts), or that is not UTF-8, is rejected with an
+error instead of being read with columns shifted. A byte order mark is
+ignored.
 
 Postgres connection strings come only from the environment, never from the URI
 or the command line: `SHDI_PG_DSN` reads the source (give it a role with
@@ -178,11 +179,13 @@ connection is also opened with file and network access turned off.
 When a later run writes a column the sink table cannot hold, the column is
 widened instead of failing or rounding, and new columns are added. In DuckDB,
 integers and decimals widen to a DECIMAL that holds both (VARCHAR past 38
-digits), an integer meeting a float gives DOUBLE, and anything else becomes
-VARCHAR. In Postgres, exact decimals are written as `numeric` and timestamps
-with a zone as `timestamptz`; an integer column meeting a decimal becomes
-`numeric`, one meeting a float becomes `double precision`, and anything else
-becomes `text`. Postgres columns outside the contract keep
+digits), an integer meeting a float gives DOUBLE, or VARCHAR when any integer
+in the table or the run is beyond 2^53, which a double cannot hold, and
+anything else becomes VARCHAR. In Postgres, exact decimals are written as
+`numeric` and timestamps with a zone as `timestamptz`; an integer column
+meeting a decimal becomes `numeric`, one meeting a float becomes `double
+precision` (or `numeric` past 2^53), floats written to a `numeric` column keep
+all their digits, and anything else becomes `text`. Postgres columns outside the contract keep
 their values but not always their type: integers, numbers, booleans, dates and
 timestamps keep it, while json and array columns land in staging as JSON text and other types
 (point, xml) as their text form.

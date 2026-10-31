@@ -410,3 +410,165 @@ def test_f4_postgres_write_run_is_one_transaction(monkeypatch):
         with psycopg.connect(writer, autocommit=True) as con:
             con.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
 
+
+
+# Second review round. R1: integer text used to go through a float.
+
+
+@pytest.mark.parametrize("text,want", [
+    ("1000000000000000000.5", None),
+    ("9007199254740993.5", None),
+    ("9007199254740993.0", 9007199254740993),
+    ("1e5", 100000),
+    ("0e30", 0),
+    ("1e999999999", None),
+])
+def test_r1_integer_text_is_parsed_exactly(text, want):
+    from shdi.values import INVALID, parse_integer
+
+    got = parse_integer(text).value
+    assert (got is INVALID) if want is None else (got == want and isinstance(got, int))
+
+
+def test_r1_number_text_keeps_huge_and_tiny_values_exact():
+    from shdi.values import INVALID, parse_number
+
+    assert parse_number("1e400").value == Decimal("1e400")
+    assert parse_number("1e-400").value == Decimal("1e-400")
+    assert parse_number("1e5").value == 100000 and isinstance(parse_number("1e5").value, int)
+    assert parse_number("1e999999999").value is INVALID
+
+
+def test_r1_fractional_text_fails_the_integer_type_check(tmp_path):
+    path = tmp_path / "s.csv"
+    path.write_text("id,n\n1,1000000000000000000.5\n2,7\n")
+    from shdi.checks import run_checks
+    from shdi.contract import contract_from_dict
+
+    c = contract_from_dict(contract(n={"type": "integer"}))
+    checks = {x.check_id: x for x in run_checks(open_source(str(path)).read(), c, AS_OF)}
+    assert not checks["type:n"].passed
+
+
+# R2: a column widened to DOUBLE rounded integers past 2**53 already staged.
+
+
+@pytest.mark.parametrize("first,second", [
+    ([9007199254740993], [1.5]),
+    ([1.5], [9007199254740993]),
+])
+def test_r2_duckdb_sink_never_rounds_earlier_or_new_integers(tmp_path, first, second):
+    db = tmp_path / "w.duckdb"
+    make_duckdb(db, "x INTEGER", [])
+    sink = DuckDBSink(str(db), "t")
+    for run, values in (("a", first), ("b", second)):
+        df = pd.DataFrame({"x": pd.Series(values)}, index=range(len(values)))
+        sink.write_run(df, pd.DataFrame(), run)
+    got = {r: v for r, v in ((r, sink.read_staging(r)["x"].iloc[0]) for r in ("a", "b"))}
+    assert same_value(got["a"], first[0], "number") and same_value(got["b"], second[0], "number"), got
+
+
+# R5: a fix in a timestamptz column used to store a naive datetime.
+
+
+def test_r5_timestamp_fix_in_an_aware_column_stays_aware():
+    from shdi.checks import run_checks
+    from shdi.contract import contract_from_dict
+    from shdi.repairs import apply_proposals, propose_repairs
+
+    aware = dt.datetime(2024, 1, 1, 5, tzinfo=dt.timezone.utc)
+    df = pd.DataFrame({"id": [1, 2], "ts": pd.Series([aware, None], dtype=object)})
+    c = contract_from_dict(contract(ts={"type": "timestamp", "nullable": False, "default": "2024-02-02T00:00:00Z"}))
+    props = [p.to_dict() for p in propose_repairs(df, c, run_checks(df, c, AS_OF), AS_OF)]
+    out = apply_proposals(df, c, props, [p["id"] for p in props]).output
+    assert all(isinstance(v, dt.datetime) and v.tzinfo is not None for v in out["ts"]), out["ts"].tolist()
+
+
+# R6: CSV write_run replaced staging before the quarantine step could fail.
+
+
+def test_r6_csv_write_run_is_all_or_nothing_and_leaves_no_temp_files(tmp_path, monkeypatch):
+    import shdi.connectors.csv as csvmod
+
+    sink = CsvSink(tmp_path, "s")
+    q = pd.DataFrame({"id": ["9"], "shdi_source_row": [0]})
+    sink.write_run(pd.DataFrame({"id": ["1"]}), q, "R1")
+    before = {p.name: p.read_bytes() for p in tmp_path.glob("*.csv")}
+
+    real, calls = csvmod.to_csv_bytes, []
+
+    def fail_second(df):
+        calls.append(1)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return real(df)
+
+    monkeypatch.setattr(csvmod, "to_csv_bytes", fail_second)
+    with pytest.raises(OSError, match="disk full"):
+        sink.write_run(pd.DataFrame({"id": ["2"]}), q, "R2")
+    assert {p.name: p.read_bytes() for p in tmp_path.glob("*.csv")} == before
+    assert not list(tmp_path.glob("*.tmp")) and not list(tmp_path.glob(".*.tmp"))
+
+
+# R7: header checks were bypassed by a BOM, a trailing comma and other encodings.
+
+
+@pytest.mark.parametrize("raw,match", [
+    ("﻿id,id\n1,2\n".encode("utf-8"), "duplicate|repeats"),
+    (b"a,b\n1,2,\n", "fields"),
+    ("id,name\n1,café\n".encode("latin-1"), "UTF-8"),
+])
+def test_r7_csv_header_and_encoding_problems_are_clean_errors(tmp_path, raw, match):
+    path = tmp_path / "s.csv"
+    path.write_bytes(raw)
+    with pytest.raises(ValueError, match=match):
+        open_source(str(path)).read()
+
+
+def test_r7_bom_is_not_part_of_the_first_column_name(tmp_path):
+    path = tmp_path / "s.csv"
+    path.write_bytes("﻿id,v\n1,2\n".encode("utf-8"))
+    assert list(open_source(str(path)).read().columns) == ["id", "v"]
+
+
+# R3, R4: Postgres numeric columns met floats through float8 (15 digits) or text.
+
+
+@pg
+def test_r3_r4_postgres_numeric_columns_take_floats_exactly(monkeypatch):
+    import psycopg
+    from psycopg import sql
+
+    from shdi.connectors.postgres import PostgresSink
+
+    writer = os.environ.get("SHDI_PG_SINK_DSN") or os.environ["SHDI_PG_DSN"]
+    schema = f"shdi_r3_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(writer, autocommit=True) as con:
+        con.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    try:
+        sink = PostgresSink(f"{schema}.m")
+        # A clamp to a float inside a Decimal column (R3), then a float that
+        # needs 17 digits into the numeric column (R4).
+        sink.write_staging(pd.DataFrame({"amt": pd.Series([Decimal("5.25"), 99.5], dtype=object)}), "a")
+        sink.write_staging(pd.DataFrame({"amt": [0.30000000000000004]}), "b")
+        # A double column holding 17-digit values, then a big integer (R2 in Postgres).
+        sink.write_staging(pd.DataFrame({"d": [0.30000000000000004]}), "c")
+        sink.write_staging(pd.DataFrame({"d": pd.Series([9007199254740993], dtype=object)}), "d")
+        with psycopg.connect(writer) as con:
+            types = dict(con.execute(
+                "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = %s "
+                "AND table_name = 'm__shdi_staging'", [schema]).fetchall())
+            rows = dict(con.execute(sql.SQL(
+                "SELECT shdi_run_id, coalesce(amt::text, '') || '|' || coalesce(d::text, '') "
+                "FROM {}.m__shdi_staging ORDER BY shdi_run_id, shdi_source_row").format(sql.Identifier(schema))).fetchall())
+            amt_a = [r[0] for r in con.execute(sql.SQL(
+                "SELECT amt::text FROM {}.m__shdi_staging WHERE shdi_run_id = 'a' ORDER BY shdi_source_row").format(
+                    sql.Identifier(schema))).fetchall()]
+        assert types["amt"] == "numeric" and types["d"] == "numeric", types
+        assert [Decimal(x) for x in amt_a] == [Decimal("5.25"), Decimal("99.5")]
+        assert rows["b"] == "0.30000000000000004|"
+        assert rows["c"] == "|0.30000000000000004"
+        assert rows["d"] == "|9007199254740993"
+    finally:
+        with psycopg.connect(writer, autocommit=True) as con:
+            con.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))

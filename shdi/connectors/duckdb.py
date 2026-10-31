@@ -238,12 +238,31 @@ class DuckDBSink:
                     _run(con, f"ALTER TABLE {qt} ADD COLUMN {quote_ident(c)} {t}")
                     continue
                 new = None if (c in all_null or untyped) else _widen(existing[c], t)
+                new = self._exact_or_text(con, qt, c, existing[c], t, new)
                 if new:
                     _run(con, f"ALTER TABLE {qt} ALTER COLUMN {quote_ident(c)} TYPE {new}")
             _run(con, f"DELETE FROM {qt} WHERE shdi_run_id = ?", [run_id])
             _run(con, f"INSERT INTO {qt} BY NAME SELECT * FROM shdi_frame")
         finally:
             con.unregister("shdi_frame")
+
+    @staticmethod
+    def _exact_or_text(con: duckdb.DuckDBPyConnection, qt: str, col: str, existing: str, wanted: str,
+                       new: Optional[str]) -> Optional[str]:
+        """A DOUBLE holds every integer only up to 2**53. Where integers meet
+        floats (either side), a larger integer in the table or the frame makes
+        the column VARCHAR instead, so no staged value is rounded."""
+        ints_in_table = existing in _INT_DIGITS and (new == "DOUBLE")
+        ints_in_frame = wanted in _INT_DIGITS and (existing in _FLOAT_TYPES or new == "DOUBLE")
+        if not (ints_in_table or ints_in_frame):
+            return new
+        c = quote_ident(col)
+        big = 0
+        if ints_in_table:
+            big += con.execute(f"SELECT count(*) FROM {qt} WHERE abs({c}::HUGEINT) > 9007199254740992").fetchall()[0][0]
+        if ints_in_frame:
+            big += con.execute(f"SELECT count(*) FROM shdi_frame WHERE abs({c}::HUGEINT) > 9007199254740992").fetchall()[0][0]
+        return "VARCHAR" if big else new
 
     def _transaction(self, steps) -> None:
         con = connect(self.path, read_only=False)
