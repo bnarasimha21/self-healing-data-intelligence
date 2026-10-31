@@ -10,6 +10,8 @@ import datetime as dt
 import math
 import re
 from dataclasses import dataclass
+from decimal import Decimal
+from fractions import Fraction
 from typing import Any, Optional
 
 import numpy as np
@@ -23,6 +25,8 @@ _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _YMD_RE = re.compile(r"^\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[T ]\S.*)?\s*$", re.ASCII)
 # Integers are stored as Int64; anything wider is not a valid integer here.
 INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
+# Every integer up to this magnitude is exact in a float64.
+FLOAT_EXACT_INT = 2**53
 # Two far-apart defaults: a text that parses differently under each one was
 # missing a part (year, month or day) that dateutil would fill in from them.
 _DEFAULT_A = dt.datetime(2001, 1, 1)
@@ -60,10 +64,16 @@ class Parsed:
     ambiguous: bool = False
 
 
+def is_nan(x: Any) -> bool:
+    """A float NaN. Sources read NULL as None or pd.NA, so a NaN that reaches a
+    check is a real NaN stored in the source (a DOUBLE 'NaN'), not a null."""
+    return isinstance(x, (float, np.floating)) and math.isnan(x)
+
+
 def is_null(x: Any) -> bool:
     if x is None:
         return True
-    if isinstance(x, str):
+    if isinstance(x, (str, Decimal)):
         return False
     try:
         res = pd.isna(x)
@@ -77,12 +87,18 @@ def _int_in_range(n: int) -> Parsed:
 
 
 def parse_integer(x: Any) -> Parsed:
+    if is_nan(x):
+        return Parsed(INVALID)
     if is_null(x):
         return Parsed(None)
     if isinstance(x, (bool, np.bool_)):
         return Parsed(INVALID)
     if isinstance(x, (int, np.integer)):
         return _int_in_range(int(x))
+    if isinstance(x, Decimal):
+        if x.is_finite() and x == x.to_integral_value():
+            return _int_in_range(int(x))
+        return Parsed(INVALID)
     if isinstance(x, (float, np.floating)):
         f = float(x)
         if math.isfinite(f) and f.is_integer():
@@ -99,35 +115,85 @@ def parse_integer(x: Any) -> Parsed:
 
 
 def parse_number(x: Any) -> Parsed:
+    """Numbers are exact: int inside the Int64 range, float when the text is
+    exactly what the float prints as, Decimal otherwise (a value beyond Int64,
+    a DECIMAL column, or more digits than a float holds)."""
+    if is_nan(x):
+        return Parsed(INVALID)
     if is_null(x):
         return Parsed(None)
     if isinstance(x, (bool, np.bool_)):
         return Parsed(INVALID)
     if isinstance(x, (int, np.integer)):
         n = int(x)
-        return Parsed(n if INT64_MIN <= n <= INT64_MAX else float(n))
+        return Parsed(n if INT64_MIN <= n <= INT64_MAX else Decimal(n))
+    if isinstance(x, Decimal):
+        return Parsed(x if x.is_finite() else INVALID)
     if isinstance(x, (float, np.floating)):
         f = float(x)
         if not math.isfinite(f):
             return Parsed(INVALID)
-        return Parsed(int(f) if f.is_integer() and INT64_MIN <= f <= INT64_MAX else f)
+        return Parsed(int(f) if f.is_integer() and abs(f) <= FLOAT_EXACT_INT else f)
     s = str(x)
     if _INT_RE.match(s):
         n = int(s.strip())
-        # Numbers are stored as floats once they do not fit in an Int64.
-        return Parsed(n if INT64_MIN <= n <= INT64_MAX else float(n))
+        return Parsed(n if INT64_MIN <= n <= INT64_MAX else Decimal(n))
     if _NUMBER_RE.match(s):
         f = float(s)
         if not math.isfinite(f):
             return Parsed(INVALID)
-        return Parsed(f)
+        exact = Decimal(s.strip())
+        # "0.1" reads back as the float 0.1; "123456789012345678.5" does not.
+        return Parsed(f if Decimal(repr(f)) == exact else exact)
     return Parsed(INVALID)
 
 
+def number_key(v: Any) -> Optional[Fraction]:
+    """Exact value of an int, float or Decimal, for comparing across types.
+
+    A float stands for the decimal it prints as (291.92, not the nearest
+    binary fraction), the same reading parse_number and exact_number use, so
+    the float 291.92 and Decimal('291.92') are the same value."""
+    if v is None or v is INVALID or isinstance(v, (bool, np.bool_)):
+        return None
+    if isinstance(v, (int, np.integer)):
+        return Fraction(int(v))
+    if isinstance(v, (float, np.floating)):
+        return Fraction(repr(float(v))) if math.isfinite(v) else None
+    if isinstance(v, Decimal):
+        return Fraction(v) if v.is_finite() else None
+    return None
+
+
+def exact_number(q: Fraction) -> Optional[Any]:
+    """The int, float or Decimal holding exactly `q`, or None when no finite
+    decimal does (a third, say)."""
+    if q.denominator == 1:
+        n = q.numerator
+        return n if INT64_MIN <= n <= INT64_MAX else Decimal(n)
+    den = q.denominator
+    while den % 2 == 0:
+        den //= 2
+    while den % 5 == 0:
+        den //= 5
+    if den != 1:
+        return None
+    # A terminating decimal: scale it to an integer and back, exactly.
+    scale = 0
+    while (q * 10**scale).denominator != 1:
+        scale += 1
+    d = Decimal((q * 10**scale).numerator).scaleb(-scale)
+    f = float(d)
+    # A float when it prints as exactly this decimal (12.345), like parse_number.
+    return f if math.isfinite(f) and Decimal(repr(f)) == d else d
+
+
 def _to_date(x: Any) -> Optional[dt.date]:
-    if isinstance(x, pd.Timestamp):
-        return x.date()
-    if isinstance(x, dt.datetime):
+    # An instant with an offset is a date in UTC, never in the local timezone,
+    # so the same row gives the same date on every machine.
+    if isinstance(x, (pd.Timestamp, dt.datetime)):
+        if x.tzinfo is not None:
+            x = x.astimezone(dt.timezone.utc)
         return x.date()
     if isinstance(x, dt.date):
         return x
@@ -150,7 +216,7 @@ def parse_date(x: Any) -> Parsed:
     try:
         if _YMD_RE.match(s):
             d = _complete(s, yearfirst=True, dayfirst=False)
-            return Parsed(d.date()) if d is not None else Parsed(INVALID)
+            return Parsed(_to_date(d)) if d is not None else Parsed(INVALID)
         month_first = _complete(s, dayfirst=False)
         if month_first is None:
             return Parsed(INVALID)
@@ -160,7 +226,10 @@ def parse_date(x: Any) -> Parsed:
             day_first = month_first
     except (ValueError, OverflowError):
         return Parsed(INVALID)
-    return Parsed(month_first.date(), ambiguous=month_first.date() != day_first.date())
+    # Text with an offset ("2024-01-01T20:00-05:00") is a moment: its date is
+    # the UTC date, as for a native aware datetime.
+    a, b = _to_date(month_first), _to_date(day_first)
+    return Parsed(a, ambiguous=a != b)
 
 
 def _complete(s: str, **kw) -> Optional[dt.datetime]:
@@ -234,6 +303,18 @@ def parse(x: Any, type_: str) -> Parsed:
     return PARSERS[type_](x)
 
 
+def number_text(v: Any) -> str:
+    """Text of an int, float or Decimal that reads back as the same value."""
+    if isinstance(v, Decimal):
+        return format(v, "f")
+    if isinstance(v, (float, np.floating)):
+        f = float(v)
+        if f.is_integer() and abs(f) <= FLOAT_EXACT_INT:
+            return str(int(f))
+        return repr(f)
+    return str(v)
+
+
 def canonical_text(value: Any, type_: str) -> Optional[str]:
     """Text form of a parsed value, as it is written to CSV output."""
     if value is None or value is INVALID:
@@ -245,18 +326,28 @@ def canonical_text(value: Any, type_: str) -> Optional[str]:
     if type_ == "boolean":
         return "true" if value else "false"
     if type_ in ("integer", "number"):
-        if isinstance(value, float) and value.is_integer():
-            return str(int(value))
-        return str(value)
+        return number_text(value)
     return str(value)
+
+
+def is_canonical(raw: Any, value: Any, type_: str) -> bool:
+    """True when a cell already holds `value` in its canonical form.
+
+    A typed instant with an offset (a TIMESTAMPTZ) is canonical as it is: the
+    contract reads it as the same moment in UTC, and nothing needs rewriting."""
+    if type_ == "timestamp" and isinstance(raw, (pd.Timestamp, dt.datetime)) and raw.tzinfo is not None:
+        return True
+    return raw_text(raw) == canonical_text(value, type_)
 
 
 def raw_text(x: Any) -> Optional[str]:
     """How a raw cell reads as text, or None for a null."""
+    if is_nan(x):
+        return "NaN"
     if is_null(x):
         return None
-    if isinstance(x, (float, np.floating)) and float(x).is_integer():
-        return str(int(x))
+    if isinstance(x, (float, np.floating, Decimal)):
+        return number_text(x)
     if isinstance(x, (pd.Timestamp, dt.datetime)):
         ts = pd.Timestamp(x)
         if ts == ts.normalize():
@@ -278,6 +369,16 @@ def to_jsonable(x: Any) -> Any:
     if isinstance(x, (float, np.floating)):
         f = float(x)
         return f if math.isfinite(f) else None
+    if isinstance(x, Decimal):
+        # JSON numbers are floats to most readers, so a Decimal that a float
+        # cannot hold exactly is kept as its text.
+        if not x.is_finite():
+            return None
+        if x == x.to_integral_value() and abs(x) <= FLOAT_EXACT_INT:
+            return int(x)
+        if Decimal(repr(float(x))) == x:
+            return float(x)
+        return format(x, "f")
     if isinstance(x, (pd.Timestamp, dt.datetime)):
         ts = pd.Timestamp(x)
         return ts.date().isoformat() if ts == ts.normalize() else ts.isoformat()

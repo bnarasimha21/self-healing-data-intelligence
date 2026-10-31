@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from .contract import Contract, resolve_bound
-from .values import INVALID, Parsed, canonical_text, parse, raw_text, to_jsonable
+from .values import INVALID, Parsed, is_canonical, parse, raw_text, to_jsonable
 
 
 @dataclass
@@ -122,7 +122,7 @@ def run_checks(
                 for i, p in enumerate(values)
                 if p.value is not None
                 and p.value is not INVALID
-                and (p.ambiguous or raw_text(raw[i]) != canonical_text(p.value, col.type))
+                and (p.ambiguous or not is_canonical(raw[i], p.value, col.type))
             ]
             add("format", f"format:{name}", name, fmt, f"{len(fmt)} values are not in canonical {col.type} form" if fmt else "")
 

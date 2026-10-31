@@ -9,22 +9,49 @@ old repair/re-validate loop (MAX_REPAIR_PASSES) is gone: the checks are run
 again on the output after apply, and anything still failing is reported.
 
 Risk policy:
-- `cast` that changes no cell text (only the storage type): `low`.
+- `cast` where every value, once stored as the contract type, reads back as
+  exactly its source text (only the storage type changes): `low`.
 - everything else (fill, clamp, rescale, null_out, drop, quarantine, a cast
-  that rewrites text such as 01/06/2024 -> 2024-01-06): `needs_approval`.
+  that rewrites text such as 01/06/2024 -> 2024-01-06 or 1.5 -> 1.50):
+  `needs_approval`.
+
+Every proposal lists the rows it touches with their keys and old and new
+values, casts and added columns included, so the audit names every cell.
+
+`apply_proposals` checks every cell it stores: if the column's type cannot
+hold a value exactly (a clamp to 99.5 in a BIGINT column), the column is
+widened, and the write is refused if any cell would still differ from the
+value in its proposal.
 """
 from __future__ import annotations
 
 import datetime as dt
+import math
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
+from decimal import Decimal
+from fractions import Fraction
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 import pandas as pd
+import pyarrow as pa
 
 from .checks import CheckResult, ParsedFrame, parse_frame, raw_text_frame, row_key
 from .contract import Contract, resolve_bound
-from .values import INVALID, canonical_text, parse, raw_text, to_jsonable
+from .values import (
+    FLOAT_EXACT_INT,
+    INVALID,
+    canonical_text,
+    exact_number,
+    is_canonical,
+    is_null,
+    number_key,
+    is_nan,
+    number_text,
+    parse,
+    raw_text,
+    to_jsonable,
+)
 
 ROW_RULES = ("quarantine_row", "drop_duplicate")
 CELL_RULES = ("fill_default", "replace_invalid", "clamp", "rescale", "null_out")
@@ -53,20 +80,41 @@ def _row_dict(df: pd.DataFrame, pos: int) -> Dict[str, Any]:
 
 
 def _storage_matches(series: pd.Series, type_: str) -> bool:
+    d = series.dtype
+    if type_ == "integer" and pd.api.types.is_integer_dtype(d):
+        return True
+    if type_ == "number" and pd.api.types.is_numeric_dtype(d) and not pd.api.types.is_bool_dtype(d):
+        return True
+    if type_ == "boolean" and pd.api.types.is_bool_dtype(d):
+        return True
+    if type_ in ("timestamp", "date") and pd.api.types.is_datetime64_any_dtype(d):
+        return True
+    # An object column of Python values (a Postgres read) is already typed
+    # when every value is of the contract type.
+    non_null = [x for x in series.tolist() if not is_null(x)]
+    if not non_null:
+        return False
     if type_ == "integer":
-        return pd.api.types.is_integer_dtype(series.dtype)
+        return all(isinstance(x, int) and not isinstance(x, bool) for x in non_null)
     if type_ == "number":
-        return pd.api.types.is_numeric_dtype(series.dtype) and not pd.api.types.is_bool_dtype(series.dtype)
+        return all(isinstance(x, (int, float, Decimal)) and not isinstance(x, bool) for x in non_null)
     if type_ == "boolean":
-        return pd.api.types.is_bool_dtype(series.dtype)
+        return all(isinstance(x, bool) for x in non_null)
     if type_ == "timestamp":
-        return pd.api.types.is_datetime64_any_dtype(series.dtype)
+        return all(isinstance(x, dt.datetime) for x in non_null)
     if type_ == "date":
-        if pd.api.types.is_datetime64_any_dtype(series.dtype):
-            return True
-        non_null = [x for x in series.tolist() if x is not None and not (isinstance(x, float) and x != x)]
-        return bool(non_null) and all(isinstance(x, dt.date) for x in non_null)
+        return all(isinstance(x, dt.date) for x in non_null)
     return True
+
+
+def _factor(f: Any) -> Fraction:
+    # 0.001 in a contract means the decimal 0.001, not the nearest float.
+    return Fraction(repr(f)) if isinstance(f, float) else Fraction(f)
+
+
+def _final_text(value: Any, type_: str) -> Optional[str]:
+    """Canonical text of a value as the typed column stores it."""
+    return canonical_text(parse(value, type_).value, type_)
 
 
 def propose_repairs(
@@ -156,19 +204,27 @@ def propose_repairs(
                     rescaled = None
                     if c.kind == "max":
                         for f in col.unit_factors:
-                            cand = value / f
-                            if (lo is None or cand >= lo) and (hi is None or cand <= hi):
+                            # Exact arithmetic: 12345 / 1000 is 12.345, which an
+                            # integer column cannot hold, so that factor is skipped.
+                            q = number_key(value) / _factor(f)
+                            if (lo is not None and q < lo) or (hi is not None and q > hi):
+                                continue
+                            if col.type == "integer" and q.denominator != 1:
+                                continue
+                            cand = exact_number(q)
+                            if cand is not None:
                                 rescaled = (f, cand)
                                 break
                     if rescaled is not None:
                         f, cand = rescaled
-                        cand = int(cand) if float(cand).is_integer() else cand
                         cell_fixes.append(dict(rule="rescale", column=name, row=r, old=raw, new=cand, check=c.check_id,
-                                               reason=f"{value} is above max {hi} but {value}/{f:g} = {cand} is in range; likely a unit error"))
+                                               reason=f"{number_text(value)} is above max {hi} but {number_text(value)}/{f:g} = "
+                                                      f"{number_text(cand)} is in range; likely a unit error"))
                     else:
                         bound = lo if c.kind == "min" else hi
                         if col.type == "integer":
-                            bound = int(bound)
+                            # The nearest whole number inside the range, not int() toward zero.
+                            bound = math.ceil(bound) if c.kind == "min" else math.floor(bound)
                         cell_fixes.append(dict(rule="clamp", column=name, row=r, old=raw, new=bound, check=c.check_id,
                                                reason=f"{value} is {'below min' if c.kind == 'min' else 'above max'} {bound}; clamp to the bound"))
                 elif col.nullable:
@@ -184,31 +240,54 @@ def propose_repairs(
         fmt = by_id.get(f"format:{name}")
         if fmt is not None and fmt.on_violation == "report_only":
             continue
-        changed = list(fmt.failing_rows) if fmt is not None else []
+        values = [p.value for p in parsed[name]]
+        rows = [r for r, v in enumerate(values) if v is not None and v is not INVALID]
+        # The value each cell will hold once stored as the contract type. Risk
+        # comes from comparing its text with the source text, so a cast that
+        # would change any value (precision, scale, a reformatted date) is
+        # never low risk.
+        typed = _typed_column([v if v is not INVALID else None for v in values], col.type).tolist()
+        # A column holding a value exactly reports the row's own canonical
+        # text (a DECIMAL(19,1) pads 5 to 5.0 for display, which is the same
+        # value); one that would change it (float rounding) reports what it
+        # actually stores, so the change shows up below.
+        new_text = {
+            r: canonical_text(values[r], col.type) if same_value(typed[r], values[r], col.type)
+            else _final_text(typed[r], col.type)
+            for r in rows
+        }
+        changed = [
+            r for r in rows
+            if parsed[name][r].ambiguous
+            or (new_text[r] != raw_text(df[name].iloc[r]) and not is_canonical(df[name].iloc[r], values[r], col.type))
+        ]
         if not changed and _storage_matches(df[name], col.type):
             continue
         ambiguous = [r for r in changed if parsed[name][r].ambiguous]
         reason = f"store '{name}' as {col.type}"
         if changed:
-            reason += f"; rewrites {len(changed)} values into canonical form"
+            reason += f"; rewrites {len(changed)} values"
         if ambiguous:
             reason += f"; {len(ambiguous)} are ambiguous and were read month-first"
         proposals.append(dict(
-            rule="cast", column=name, rows=changed,
-            row_keys=[row_key(df, r, contract) for r in changed],
-            old_values=[to_jsonable(raw_text(df[name].iloc[r])) for r in changed],
-            new_values=[canonical_text(parsed[name][r].value, col.type) for r in changed],
+            rule="cast", column=name, rows=rows,
+            row_keys=[row_key(df, r, contract) for r in rows],
+            old_values=[to_jsonable(raw_text(df[name].iloc[r])) for r in rows],
+            new_values=[new_text[r] for r in rows],
             reason=reason, risk="low" if not changed else "needs_approval",
             check_ids=[f"format:{name}"] if changed else [],
         ))
 
-    # 2) required columns that are missing and have a default.
+    # 2) required columns that are missing and have a default: every row gets it.
     for c in checks:
         if c.kind == "required" and not c.passed and c.on_violation == "propose_fix":
             col = contract.columns[c.column]
             if col.default is not None:
+                n = len(df)
                 proposals.append(dict(
-                    rule="add_column", column=c.column, rows=[], row_keys=[], old_values=[], new_values=[col.default],
+                    rule="add_column", column=c.column, rows=list(range(n)),
+                    row_keys=[row_key(df, r, contract) for r in range(n)],
+                    old_values=[None] * n, new_values=[to_jsonable(col.default)] * n,
                     reason=f"required column '{c.column}' is missing; add it filled with default {col.default!r}",
                     risk="needs_approval", check_ids=[c.check_id],
                 ))
@@ -257,19 +336,97 @@ class ApplyResult:
     rows_quarantined: int
 
 
+def _decimal_column(values: List[Any]) -> pd.Series:
+    """Exact numbers that neither Int64 nor Float64 holds, as a DECIMAL column
+    wide enough for every value; text when even DECIMAL(38) is too narrow."""
+    decs = [None if v is None else Decimal(number_text(v)) for v in values]
+    present = [d for d in decs if d is not None]
+    scale = max([max(-d.as_tuple().exponent, 0) for d in present] or [0])
+    whole = max([max(d.adjusted() + 1, 1) for d in present] or [1])
+    if whole + scale <= 38:
+        arr = pa.array(decs, type=pa.decimal128(whole + scale, scale))
+        return pd.Series(arr, dtype=pd.ArrowDtype(arr.type))
+    return pd.Series([None if d is None else format(d, "f") for d in decs], dtype="object")
+
+
 def _typed_column(values: List[Any], type_: str) -> pd.Series:
+    """A column of parsed values in the narrowest storage that holds each exactly."""
     if type_ == "integer":
         return pd.Series(values, dtype="Int64")
     if type_ == "number":
-        if all(v is None or isinstance(v, int) for v in values):
+        present = [v for v in values if v is not None]
+        if all(isinstance(v, int) for v in present):
             return pd.Series(values, dtype="Int64")
-        return pd.Series([None if v is None else float(v) for v in values], dtype="Float64")
+        # A float64 holds every int up to 2**53 and every float exactly; past
+        # that, 123456789012345678 next to 1.5 would round to ...680.
+        if all(isinstance(v, float) or (isinstance(v, int) and abs(v) <= FLOAT_EXACT_INT) for v in present):
+            return pd.Series([None if v is None else float(v) for v in values], dtype="Float64")
+        return _decimal_column(values)
     if type_ == "boolean":
         return pd.Series(values, dtype="boolean")
     if type_ == "timestamp":
         return pd.Series(pd.to_datetime(values), dtype="datetime64[us]")
     # date: python date objects keep date semantics in every sink.
     return pd.Series(values, dtype="object")
+
+
+def same_value(a: Any, b: Any, type_: Optional[str]) -> bool:
+    """True when two cells hold the same value under the contract type (1.5 and
+    Decimal('1.50') in a number column), or the same text outside the contract."""
+    ta, tb = raw_text(a), raw_text(b)
+    if ta is None or tb is None:
+        return ta is None and tb is None
+    if type_ is not None:
+        pa_, pb_ = parse(a, type_).value, parse(b, type_).value
+        if pa_ is not INVALID and pb_ is not INVALID:
+            if type_ in ("integer", "number"):
+                return number_key(pa_) == number_key(pb_)
+            return pa_ == pb_
+    return ta == tb
+
+
+def _is_text(series: pd.Series) -> bool:
+    d = series.dtype
+    if pd.api.types.is_numeric_dtype(d) or pd.api.types.is_datetime64_any_dtype(d) or pd.api.types.is_bool_dtype(d):
+        return False
+    return all(isinstance(v, str) for v in series.tolist() if not is_null(v))
+
+
+def _restore(values: List[Any], dtype: Any, type_: Optional[str]) -> pd.Series:
+    """Put a column back in its source dtype, but only if that keeps every value.
+
+    `astype` truncates silently (99.5 into BIGINT gives 99), so each cell is
+    compared with what was put in. When the dtype loses anything the column is
+    widened: exact numbers for a number column, text for anything else."""
+    if dtype is not None:
+        src = values
+        if isinstance(dtype, pd.ArrowDtype) and pa.types.is_decimal(dtype.pyarrow_dtype):
+            # Arrow will not take a float into a decimal column; the float's
+            # printed digits are its value here, so hand it over as a Decimal.
+            src = [Decimal(number_text(v)) if isinstance(v, (int, float)) and not isinstance(v, bool)
+                   and not is_nan(v) else v for v in values]
+        try:
+            if isinstance(dtype, pd.ArrowDtype):
+                # Built by Arrow itself: pandas' astype would turn a NaN into a
+                # null, and Arrow refuses (rather than truncates) 99.5 as int64.
+                arr = pa.array([None if v is pd.NA or v is pd.NaT else v for v in src],
+                               type=dtype.pyarrow_dtype, from_pandas=False)
+                s = pd.Series(arr, dtype=dtype)
+            else:
+                s = pd.Series(src, dtype="object").astype(dtype)
+        except Exception:  # noqa: BLE001 - any failure means "does not fit"
+            s = None
+        if s is not None and all(same_value(a, b, type_) for a, b in zip(values, s.tolist())):
+            return s
+    if type_ in ("integer", "number"):
+        parsed = [parse(v, "number").value for v in values]
+        if INVALID not in parsed:
+            s = _typed_column(parsed, "number")
+            if all(same_value(a, b, type_) for a, b in zip(values, s.tolist())):
+                return s
+    if dtype is not None and all(isinstance(v, str) for v in values if not is_null(v)):
+        return pd.Series([None if is_null(v) else v for v in values], dtype="object")
+    return pd.Series([raw_text(v) for v in values], dtype="object")
 
 
 def apply_proposals(
@@ -282,17 +439,22 @@ def apply_proposals(
 
     `df` must be the same data the proposals were computed from (the caller
     checks the source fingerprint). Rows are identified by ordinal position.
+    Raises RuntimeError rather than return an output in which an applied cell
+    differs from the value its proposal (and so the audit log) records.
     """
     approved: Set[str] = set(approved_ids)
     props = [p for p in proposals if p["id"] in approved]
     columns = {c: df[c].tolist() for c in df.columns}
     dtypes = {c: df[c].dtype for c in df.columns}
+    text_columns = {c for c in df.columns if _is_text(df[c])}
     n = len(df)
     removed: Dict[int, Dict[str, Any]] = {}
     applied: List[str] = []
     skipped: List[Dict[str, str]] = []
-    changed_cells: Set[tuple] = set()  # (row, column); a cell fixed and cast counts once
     quarantine_rows: List[Dict[str, Any]] = []
+
+    def ctype(column: str) -> Optional[str]:
+        return contract.columns[column].type if column in contract.columns else None
 
     for p in props:
         if p["rule"] in ROW_RULES:
@@ -307,22 +469,28 @@ def apply_proposals(
                 row.update({"shdi_source_row": r, "shdi_proposal_id": p["id"], "shdi_reason": p["reason"]})
                 quarantine_rows.append(row)
 
+    added: Set[str] = set()
     for p in props:
         if p["rule"] == "add_column":
             columns[p["column"]] = [p["new_values"][0]] * n
             dtypes[p["column"]] = None
+            text_columns.add(p["column"])
+            added.add(p["column"])
             applied.append(p["id"])
-            changed_cells.update((r, p["column"]) for r in range(n) if r not in removed)
 
     def store(column: str, value: Any) -> Any:
-        dtype = dtypes.get(column)
         if value is None:
             return None
-        if dtype is None or not (pd.api.types.is_numeric_dtype(dtype) or pd.api.types.is_datetime64_any_dtype(dtype)):
-            type_ = contract.columns[column].type if column in contract.columns else "string"
-            return canonical_text(parse(value, type_).value, type_) or str(value)
-        return value
+        type_ = ctype(column)
+        if column in text_columns:
+            # A text source (CSV, VARCHAR) keeps text, in canonical form.
+            return canonical_text(parse(value, type_).value, type_) if type_ else str(value)
+        if type_ is None:
+            return value
+        v = parse(value, type_).value
+        return value if v is INVALID else v
 
+    applied_cells: List[tuple] = []
     for p in props:
         if p["rule"] not in CELL_RULES:
             continue
@@ -336,17 +504,16 @@ def apply_proposals(
             continue
         columns[col][r] = store(col, p["new_values"][0])
         applied.append(p["id"])
-        changed_cells.add((r, col))
+        applied_cells.append((r, col, p["new_values"][0], p["id"]))
 
     keep = [r for r in range(n) if r not in removed]
-    out = pd.DataFrame({c: [columns[c][r] for r in keep] for c in columns}, index=keep)
-    for c in df.columns:
-        if dtypes.get(c) is not None and c in out.columns:
-            try:
-                out[c] = out[c].astype(dtypes[c])
-            except (TypeError, ValueError):
-                pass
+    out = pd.DataFrame(
+        {c: _restore([columns[c][r] for r in keep], dtypes.get(c), ctype(c)).set_axis(keep) for c in columns},
+        index=keep,
+    )
 
+    cast_cells: List[tuple] = []
+    fixed = {(r, c) for r, c, _, _ in applied_cells}
     for p in props:
         if p["rule"] != "cast":
             continue
@@ -359,7 +526,23 @@ def apply_proposals(
             continue
         out[name] = _typed_column([x.value for x in parsed], type_).set_axis(out.index)
         applied.append(p["id"])
-        changed_cells.update((r, name) for r in p["rows"] if r not in removed)
+        cast_cells.extend(
+            (r, name, new, p["id"]) for r, new in zip(p["rows"], p["new_values"]) if r not in removed and (r, name) not in fixed
+        )
+
+    # The written value must be the audited value, for every applied cell.
+    for r, col, new, pid in applied_cells + cast_cells:
+        got = out.at[r, col]
+        if not same_value(got, new, ctype(col)):
+            raise RuntimeError(
+                f"refusing to write: {pid} records {col}={new!r} for row {r} but the output holds {raw_text(got)!r}"
+            )
+
+    # A cell counts as changed when its text in the output differs from the source.
+    cells_changed = len(keep) * len(added)
+    for c in df.columns:
+        before, after = df[c].tolist(), out[c].tolist()
+        cells_changed += sum(1 for i, r in enumerate(keep) if raw_text(before[r]) != raw_text(after[i]))
 
     quarantine = pd.DataFrame(quarantine_rows)
     return ApplyResult(
@@ -367,7 +550,7 @@ def apply_proposals(
         quarantine=quarantine,
         applied=applied,
         skipped=skipped,
-        cells_changed=len(changed_cells),
+        cells_changed=cells_changed,
         rows_dropped=sum(1 for p in removed.values() if p["rule"] == "drop_duplicate"),
         rows_quarantined=len(quarantine_rows),
     )

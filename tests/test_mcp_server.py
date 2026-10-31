@@ -226,7 +226,8 @@ def test_a_clean_source_pauses_and_only_decide_writes(setup):
             assert val["passed"] and val["outliers"] == []
             run = await call(s, "propose_repairs", uri=uri, contract="sales", as_of=AS_OF.isoformat())
             assert run["status"] == "awaiting_approval" and run["needs_approval"] == []
-            assert all(p["risk"] == "low" and p["row_count"] == 0 for p in run["proposals"])
+            # Storage casts list every row they touch, and change no value's text.
+            assert all(p["risk"] == "low" and p["old_values"] == p["new_values"] for p in run["proposals"])
             assert tables(db) == {"sales"}
             done = await call(s, "decide", thread_id=run["thread_id"], reviewer="alice")
             assert done["status"] == "completed" and done["outcome"] == "passed"
