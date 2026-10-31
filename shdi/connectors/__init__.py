@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -15,6 +16,21 @@ from .base import Sink, Source, frame_fingerprint, to_csv_bytes  # noqa: F401
 
 class SourceURIError(ValueError):
     pass
+
+
+# A table is `table` or `schema.table`, each part a plain identifier. Anything else
+# (a quoted path like "/etc/x.csv", a URL, a table function) is refused, because
+# DuckDB would happily read a file named in the table position.
+_TABLE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?", re.ASCII)
+
+
+def check_table_name(table: str) -> str:
+    if not _TABLE_RE.fullmatch(table):
+        raise SourceURIError(
+            f"table {table!r} is not a plain identifier; use <table> or <schema>.<table> "
+            "with letters, digits and underscores"
+        )
+    return table
 
 
 def parse_uri(uri: str) -> Tuple[str, str, Optional[str]]:
@@ -29,7 +45,7 @@ def parse_uri(uri: str) -> Tuple[str, str, Optional[str]]:
         table = u[len("postgres:"):]
         if not table:
             raise SourceURIError("postgres URI needs a table: postgres:<schema>.<table>")
-        return "postgres", "", table
+        return "postgres", "", check_table_name(table)
     if u.startswith("duckdb:"):
         rest = u[len("duckdb:"):]
         if rest.startswith("//"):
@@ -42,7 +58,7 @@ def parse_uri(uri: str) -> Tuple[str, str, Optional[str]]:
                 "duckdb URI needs a file path and a table; in-memory databases cannot be "
                 "re-opened after a pause, so they are not accepted as sources"
             )
-        return "duckdb", str(Path(path).expanduser().resolve()), table
+        return "duckdb", str(Path(path).expanduser().resolve()), check_table_name(table)
     if u.startswith("csv:"):
         u = u[len("csv:"):]
     if u.lower().endswith(".csv"):

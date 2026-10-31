@@ -22,6 +22,15 @@ from .base import (
 )
 
 
+# No file, URL or extension access on any connection we open. The source table
+# name is already restricted to identifiers; this is the second lock on the door.
+_CONFIG = {"enable_external_access": False}
+
+
+def connect(path: str, read_only: bool) -> duckdb.DuckDBPyConnection:
+    return duckdb.connect(path, read_only=read_only, config=dict(_CONFIG))
+
+
 def quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
@@ -38,7 +47,7 @@ class DuckDBSource:
         self.name = table.split(".")[-1]
 
     def read(self, limit: Optional[int] = None) -> pd.DataFrame:
-        con = duckdb.connect(self.path, read_only=True)
+        con = connect(self.path, read_only=True)
         try:
             q = f"SELECT * FROM {quote_table(self.table)}"
             try:
@@ -56,6 +65,28 @@ class DuckDBSource:
         return frame_fingerprint(self.read())
 
 
+_INTEGER_TYPES = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT"}
+
+
+def _widen(existing: str, wanted: str) -> Optional[str]:
+    """The type to change an existing sink column to, or None to leave it."""
+    if wanted == "NULL" or existing == wanted or existing == "VARCHAR":
+        return None
+    if existing in _INTEGER_TYPES and wanted in _INTEGER_TYPES | {"DOUBLE", "FLOAT"}:
+        return "DOUBLE" if wanted in ("DOUBLE", "FLOAT") else "BIGINT"
+    return "VARCHAR"
+
+
+def _frame_types(con: duckdb.DuckDBPyConnection) -> List[tuple]:
+    """(column, type) for the registered frame. An all-null column has type NULL,
+    which DuckDB cannot store later values in, so it is created as VARCHAR."""
+    return [(r[0], r[1]) for r in con.execute("DESCRIBE SELECT * FROM shdi_frame").fetchall()]
+
+
+def _table_types(con: duckdb.DuckDBPyConnection, table: str) -> dict:
+    return {r[0]: r[1] for r in con.execute(f"DESCRIBE {quote_table(table)}").fetchall()}
+
+
 class DuckDBSink:
     def __init__(self, path: str, table: str):
         self.path = path
@@ -65,11 +96,21 @@ class DuckDBSink:
         target = self.table + suffix
         check_target(target)
         qt = quote_table(target)
-        con = duckdb.connect(self.path)
+        con = connect(self.path, read_only=False)
         try:
             con.register("shdi_frame", df)
             con.execute("BEGIN")
-            con.execute(f"CREATE TABLE IF NOT EXISTS {qt} AS SELECT * FROM shdi_frame WHERE false")
+            wanted = _frame_types(con)
+            cols = ", ".join(f"{quote_ident(c)} {'VARCHAR' if t == 'NULL' else t}" for c, t in wanted)
+            con.execute(f"CREATE TABLE IF NOT EXISTS {qt} ({cols})")
+            existing = _table_types(con, target)
+            for c, t in wanted:
+                if c not in existing:
+                    con.execute(f"ALTER TABLE {qt} ADD COLUMN {quote_ident(c)} {'VARCHAR' if t == 'NULL' else t}")
+                    continue
+                new = _widen(existing[c], t)
+                if new:
+                    con.execute(f"ALTER TABLE {qt} ALTER COLUMN {quote_ident(c)} TYPE {new}")
             con.execute(f"DELETE FROM {qt} WHERE shdi_run_id = ?", [run_id])
             con.execute(f"INSERT INTO {qt} BY NAME SELECT * FROM shdi_frame")
             con.execute("COMMIT")
@@ -92,7 +133,7 @@ class DuckDBSink:
         return self._write(with_meta(quarantine_as_text(df), run_id), run_id, QUARANTINE_SUFFIX)
 
     def _read(self, suffix: str, run_id: Optional[str]) -> pd.DataFrame:
-        con = duckdb.connect(self.path, read_only=True)
+        con = connect(self.path, read_only=True)
         try:
             parts = (self.table + suffix).split(".")
             q_exists = "SELECT count(*) FROM information_schema.tables WHERE table_name = ?"
