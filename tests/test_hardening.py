@@ -291,14 +291,15 @@ def test_cli_exit_code_is_nonzero_when_checks_fail_or_source_is_stale(dirty_csv,
 
 
 def test_bench_counts_an_untouched_null_as_missed():
+    from bench.corrupt import TEXT
     from bench.score import _outcome
 
     clean = pd.DataFrame({"id": ["1"], "date": ["2024-01-01"], "sales": ["500"], "region": ["North"], "notes": ["ok"]})
     label = {"source_row": 0, "defect_type": "null", "column": "region", "injected_value": ""}
     staged = {0: {"id": "1", "date": "2024-01-01", "sales": "500", "region": None, "notes": "ok"}}
-    assert _outcome(label, staged, set(), clean, {"region": "Unknown"}) == "missed"
+    assert _outcome(TEXT, label, staged, set(), clean, {"region": "Unknown"}) == "missed"
     staged[0]["region"] = "Unknown"
-    assert _outcome(label, staged, set(), clean, {"region": "Unknown"}) == "neutralized"
+    assert _outcome(TEXT, label, staged, set(), clean, {"region": "Unknown"}) == "neutralized"
 
 
 # Postgres (needs SHDI_PG_DSN; see docker-compose.test.yml)
