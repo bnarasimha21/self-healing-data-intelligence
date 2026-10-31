@@ -120,12 +120,14 @@ def _outcome(label: Dict[str, Any], staged: Dict[int, Dict[str, Any]], quarantin
     want = norm(col, clean.at[row, col])
     if got == want:
         return "restored"
-    if got is None or (defaults.get(col) is not None and got == str(defaults[col])):
-        return "neutralized"
+    # A defect left exactly as injected was missed, even when the injected value
+    # is a null: checking this first stops an untouched null counting as neutralized.
     injected = label["injected_value"]
     injected = None if injected is None or (isinstance(injected, float) and math.isnan(injected)) or injected == "" else injected
     if got == norm(col, injected):
         return "missed"
+    if got is None or (defaults.get(col) is not None and got == str(defaults[col])):
+        return "neutralized"
     return "wrong"
 
 
@@ -182,6 +184,16 @@ def score(rows: int = 10000, seed: int = 7, rate: float = 0.015, out: Optional[P
                 changed += len(corrupt.COLUMNS)
                 continue
             changed += sum(norm(c, staged[r].get(c)) != norm(c, clean.at[r, c]) for c in corrupt.COLUMNS)
+        # Changes to the other columns of a row that carries a defect. Fixing one
+        # cell must not disturb its neighbours.
+        collateral = 0
+        for label in labels.to_dict("records"):
+            r = int(label["source_row"])
+            if label["defect_type"] == "duplicate" or r not in staged:
+                continue
+            collateral += sum(
+                norm(c, staged[r].get(c)) != norm(c, clean.at[r, c]) for c in corrupt.COLUMNS if c != label["column"]
+            )
         clean_outliers = sorted(
             {int(x) for a in res["anomalies"] for x in a["rows"]} - defect_rows
         )
@@ -202,6 +214,7 @@ def score(rows: int = 10000, seed: int = 7, rate: float = 0.015, out: Optional[P
             "false_changes": changed,
             "false_change_rate": changed / cells if cells else 0.0,
             "clean_rows_lost": lost_rows,
+            "collateral_changes": collateral,
             "duplicate_originals_kept": sum(1 for r in dup_sources if r in staged),
             "clean_outlier_findings": len(clean_outliers),
             "failing_checks_after": failing_after,
@@ -255,6 +268,7 @@ def render(r: Dict[str, Any]) -> str:
         "",
         f"* False-change rate on clean cells: {_pct(r['false_change_rate'])} "
         f"({r['false_changes']} of {r['clean_cells']}; clean rows lost: {r['clean_rows_lost']}).",
+        f"* Collateral changes to other cells of defect rows: {r['collateral_changes']}.",
         f"* Outlier findings on clean rows of the dirty table: {r['clean_outlier_findings']}.",
         f"* Failing checks on the repaired output: {len(r['failing_checks_after'])}"
         + (f" ({', '.join(r['failing_checks_after'])})" if r["failing_checks_after"] else "") + ".",
