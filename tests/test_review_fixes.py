@@ -431,11 +431,17 @@ def test_r1_integer_text_is_parsed_exactly(text, want):
 
 
 def test_r1_number_text_keeps_huge_and_tiny_values_exact():
-    from shdi.values import INVALID, parse_number
+    from shdi.values import INVALID, is_canonical, parse_number
 
     assert parse_number("1e400").value == Decimal("1e400")
     assert parse_number("1e-400").value == Decimal("1e-400")
-    assert parse_number("1e5").value == 100000 and isinstance(parse_number("1e5").value, int)
+    # Text a float prints as exactly is that float, so the sink's own output
+    # ("1e+17" from a float column) reads back as canonical.
+    assert parse_number("9007199254740993.0").value == 9007199254740993
+    assert parse_number("123456789012345678.5").value == Decimal("123456789012345678.5")
+    for text in ("1e+17", "2.5e+20", "1.5e+300", "0.1"):
+        assert isinstance(parse_number(text).value, float), text
+        assert is_canonical(text, parse_number(text).value, "number"), text
     assert parse_number("1e999999999").value is INVALID
 
 
@@ -453,13 +459,14 @@ def test_r1_fractional_text_fails_the_integer_type_check(tmp_path):
 # R2: a column widened to DOUBLE rounded integers past 2**53 already staged.
 
 
-@pytest.mark.parametrize("first,second", [
-    ([9007199254740993], [1.5]),
-    ([1.5], [9007199254740993]),
+@pytest.mark.parametrize("first,second,ddl", [
+    ([9007199254740993], [1.5], "x INTEGER"),
+    ([1.5], [9007199254740993], "x INTEGER"),
+    ([-(2**127)], [1.5], "x HUGEINT"),
 ])
-def test_r2_duckdb_sink_never_rounds_earlier_or_new_integers(tmp_path, first, second):
+def test_r2_duckdb_sink_never_rounds_earlier_or_new_integers(tmp_path, first, second, ddl):
     db = tmp_path / "w.duckdb"
-    make_duckdb(db, "x INTEGER", [])
+    make_duckdb(db, ddl, [])
     sink = DuckDBSink(str(db), "t")
     for run, values in (("a", first), ("b", second)):
         df = pd.DataFrame({"x": pd.Series(values)}, index=range(len(values)))

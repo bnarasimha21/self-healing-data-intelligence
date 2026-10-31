@@ -2,9 +2,12 @@
 
 A Source is read-only. A Sink writes only `<table>__shdi_staging` and
 `<table>__shdi_quarantine`, never the source table. `write_run` replaces the
-run's rows in both tables inside one transaction (one file lock for CSV), so
-retrying a write is idempotent and a failure leaves neither table half
-written; `delete_run` removes them, which a run whose source went stale uses.
+run's rows in both tables inside one transaction, so retrying a write is
+idempotent and a failure leaves neither table half written. CSV has no
+transaction: under one file lock both files are built and written to temp
+files first, so only a failure between the two final renames could leave
+them out of step, and a retry repairs that. `delete_run` removes a run's
+rows, which a run whose source went stale uses.
 """
 from __future__ import annotations
 

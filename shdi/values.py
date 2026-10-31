@@ -147,16 +147,17 @@ def parse_number(x: Any) -> Parsed:
         # (Fraction, int) would also build numbers of that many digits.
         if not exact.is_finite() or (exact and abs(exact.adjusted()) > 1000):
             return Parsed(INVALID)
-        if exact == exact.to_integral_value():
-            # "1e5" is the integer 100000, as the float 100000.0 is. Past
-            # Int64 it stays Decimal, never int() of 1e999999999.
-            if not exact or (exact.adjusted() <= 18 and INT64_MIN <= int(exact) <= INT64_MAX):
-                return Parsed(int(exact))
-            return Parsed(exact)
         f = float(exact)
-        # "0.1" reads back as the float 0.1; "123456789012345678.5" does not,
-        # and "1e-400" underflows a float, so both stay Decimal.
-        return Parsed(f if math.isfinite(f) and f != 0.0 and Decimal(repr(f)) == exact else exact)
+        # Text a float prints as exactly ("0.1", "1e+17", "2.5e+20") is that
+        # float, so the sink's own output reads back as canonical.
+        if math.isfinite(f) and Decimal(repr(f)) == exact:
+            return Parsed(f)
+        # Otherwise exact: "9007199254740993.0" is that integer, and
+        # "123456789012345678.5" or "1e-400" (a float underflow) stay Decimal.
+        # adjusted() first, never int() of 1e999.
+        if exact == exact.to_integral_value() and exact.adjusted() <= 18 and INT64_MIN <= int(exact) <= INT64_MAX:
+            return Parsed(int(exact))
+        return Parsed(exact)
     return Parsed(INVALID)
 
 

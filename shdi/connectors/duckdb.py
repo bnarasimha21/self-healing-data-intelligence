@@ -251,7 +251,9 @@ class DuckDBSink:
                        new: Optional[str]) -> Optional[str]:
         """A DOUBLE holds every integer only up to 2**53. Where integers meet
         floats (either side), a larger integer in the table or the frame makes
-        the column VARCHAR instead, so no staged value is rounded."""
+        the column VARCHAR instead, so no staged value is rounded. Compared as
+        DOUBLE, which never overflows (a HUGEINT cast would at 2**127) and
+        rounds 2**53 + 1 down to 2**53, which the >= still catches."""
         ints_in_table = existing in _INT_DIGITS and (new == "DOUBLE")
         ints_in_frame = wanted in _INT_DIGITS and (existing in _FLOAT_TYPES or new == "DOUBLE")
         if not (ints_in_table or ints_in_frame):
@@ -259,9 +261,9 @@ class DuckDBSink:
         c = quote_ident(col)
         big = 0
         if ints_in_table:
-            big += con.execute(f"SELECT count(*) FROM {qt} WHERE abs({c}::HUGEINT) > 9007199254740992").fetchall()[0][0]
+            big += con.execute(f"SELECT count(*) FROM {qt} WHERE {c}::DOUBLE >= 9007199254740992 OR {c}::DOUBLE <= -9007199254740992").fetchall()[0][0]
         if ints_in_frame:
-            big += con.execute(f"SELECT count(*) FROM shdi_frame WHERE abs({c}::HUGEINT) > 9007199254740992").fetchall()[0][0]
+            big += con.execute(f"SELECT count(*) FROM shdi_frame WHERE {c}::DOUBLE >= 9007199254740992 OR {c}::DOUBLE <= -9007199254740992").fetchall()[0][0]
         return "VARCHAR" if big else new
 
     def _transaction(self, steps) -> None:
