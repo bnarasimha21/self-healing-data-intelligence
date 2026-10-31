@@ -59,6 +59,7 @@ class PipelineState(TypedDict, total=False):
     contract: Dict[str, Any]
     as_of: str
     auto_approve: bool
+    always_pause: bool
     reviewer: Optional[str]
     user_request: str
     # Working artifacts (JSON only, so they serialize into the checkpoint)
@@ -175,7 +176,9 @@ def node_approve(state: PipelineState) -> Dict[str, Any]:
         ts = now_iso()
         for p in proposals:
             decide(p["id"], "approved", state.get("reviewer") or "auto-approve", ts)
-    elif proposals:
+    elif proposals or state.get("always_pause"):
+        # always_pause (set by the MCP server) pauses even with nothing to
+        # decide, so the only call that writes is the one that resumes.
         first = True
         while first or any(p["risk"] == "needs_approval" and p["id"] not in decisions for p in proposals):
             first = False

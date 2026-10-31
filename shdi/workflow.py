@@ -38,6 +38,7 @@ def start_run(
     as_of: Optional[dt.date] = None,
     graph: Any = None,
     user_request: str = "Validate against the contract and propose repairs.",
+    always_pause: bool = False,
 ) -> Dict[str, Any]:
     if isinstance(contract, (str, Path)):
         contract = load_contract(contract)
@@ -54,6 +55,7 @@ def start_run(
         "contract": contract.model_dump(mode="json"),
         "as_of": (as_of or dt.date.today()).isoformat(),
         "auto_approve": auto_approve,
+        "always_pause": always_pause,
         "reviewer": reviewer,
         "user_request": user_request,
         "messages": [],
@@ -138,7 +140,10 @@ def decide(
     already = set(st["decisions"])
     new_approved = [i for i in approved if i not in already]
     new_rejected = [i for i in rejected if i not in already]
-    if not (new_approved or new_rejected or approve_all or reject_all):
+    if not (new_approved or new_rejected or approve_all or reject_all) and st["needs_approval"]:
+        # Nothing new to record and a person still has to decide: stay paused.
+        # When nothing needs approval, resuming applies the run (low-risk
+        # proposals are approved by policy), which is how a clean run finishes.
         st["ignored"] = sorted(set(approved) | set(rejected))
         return st
     with tracer().start_as_current_span("shdi.resume") as span:

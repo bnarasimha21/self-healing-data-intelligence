@@ -171,6 +171,17 @@ SHDI_LLM=explain shdi run examples/dirty_sales.csv --contract contracts/sales.ya
 
 `SHDI_LLM_MODEL` picks the Gradient model (default `llama3.3-70b-instruct`).
 
+## MCP server
+
+`shdi-mcp` serves the workflow over MCP (stdio) with six tools:
+`profile_source`, `validate`, `propose_repairs`, `list_pending`, `decide` and
+`get_audit`. Only `decide` writes, and only to staging and quarantine; a run
+started by `propose_repairs` always pauses first. Sources must match
+`SHDI_ALLOWED_SOURCES` (nothing is allowed when it is unset), contracts are
+names inside `SHDI_CONTRACT_DIR`, and connection strings come from the server's
+environment, never from tool arguments. Setup and a client config example:
+[docs/mcp.md](docs/mcp.md).
+
 ## Benchmark
 
 `make bench` generates 10,000 clean sales rows from a fixed seed, injects 1,050

@@ -13,6 +13,7 @@ dynamic = ["dependencies"]
 
 [project.scripts]
 shdi = "shdi.cli:main"
+shdi-mcp = "shdi.mcp_server:main"
 
 [tool.setuptools]
 packages = ["shdi", "shdi.connectors"]
