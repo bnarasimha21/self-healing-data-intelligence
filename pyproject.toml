@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shdi"
+version = "0.2.0"
+description = "Contract-driven data validation with human-approved repairs, built on LangGraph"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[project.scripts]
+shdi = "shdi.cli:main"
+shdi-mcp = "shdi.mcp_server:main"
+
+[tool.setuptools]
+packages = ["shdi", "shdi.connectors"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "postgres: needs a Postgres server; skipped unless SHDI_PG_DSN is set",
+]

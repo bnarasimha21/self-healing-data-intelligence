@@ -1,0 +1,13 @@
+id,date,sales,region,notes
+1,2024-01-05,100,North,ok
+2,01/06/2024,200,North,ok
+3,2024/07/01,three hundred,South,ok
+4,2050-12-01,1000,East,ok
+5,1960-01-01,50,West,ok
+5,1960-01-01,50,West,ok
+6,2025-01-01,400000,North,ok
+7,,700,South,ok
+8,2024-02-29,80,East,ok
+9,2024-03-10,100,West,ok
+10,2024-03-11,90,,ok
+11,2024-03-12,-5,East,ok

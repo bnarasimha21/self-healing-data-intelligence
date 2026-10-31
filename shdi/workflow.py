@@ -1,0 +1,222 @@
+"""Run-level operations shared by the CLI and the MCP server.
+
+Every call goes through the compiled graph and its checkpointer, so a run
+started by one process can be reviewed and resumed by another.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import fcntl
+import hashlib
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Dict, Iterable, Optional, Union
+
+from langgraph.types import Command
+
+from .audit import AuditLog, now_iso
+from .config import home, llm_mode, sink_dir as default_sink_dir
+from .connectors import canonical_uri
+from .contract import Contract, load_contract
+from .graph import build_graph
+from .tracing import tracer
+
+
+class WorkflowError(ValueError):
+    pass
+
+
+def _config(run_id: str) -> Dict[str, Any]:
+    return {"configurable": {"thread_id": run_id}}
+
+
+@contextmanager
+def run_lock(run_id: str):
+    """Serialise start and decide on one run across processes (CLI, MCP server).
+
+    Without it two reviewers resuming the same run at once can each apply,
+    leaving the audit log and the staging output disagreeing."""
+    d = home() / "locks"
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / (hashlib.sha256(run_id.encode()).hexdigest()[:32] + ".lock")
+    with open(path, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def start_run(
+    source_uri: str,
+    contract: Union[str, Path, Contract, Dict[str, Any]],
+    *,
+    auto_approve: bool = False,
+    reviewer: Optional[str] = None,
+    run_id: Optional[str] = None,
+    sink_dir: Optional[str] = None,
+    as_of: Optional[dt.date] = None,
+    graph: Any = None,
+    user_request: str = "Validate against the contract and propose repairs.",
+    always_pause: bool = False,
+) -> Dict[str, Any]:
+    if isinstance(contract, (str, Path)):
+        contract = load_contract(contract)
+    if isinstance(contract, dict):
+        contract = Contract.model_validate(contract)
+    llm_mode()  # a bad SHDI_LLM fails here, before a run exists
+    graph = graph or build_graph()
+    run_id = run_id or uuid.uuid4().hex[:12]
+    with run_lock(run_id):
+        return _start(graph, run_id, source_uri, contract, auto_approve, reviewer, sink_dir, as_of,
+                      user_request, always_pause)
+
+
+def _start(graph, run_id, source_uri, contract, auto_approve, reviewer, sink_dir, as_of, user_request, always_pause):
+    if graph.get_state(_config(run_id)).values:
+        raise WorkflowError(f"run {run_id} already exists")
+    if AuditLog().events(run_id):
+        # The audit log outlived the checkpoint; reusing the id would mix two runs' records.
+        raise WorkflowError(f"run id {run_id} already has audit records; choose another id")
+    state = {
+        "run_id": run_id,
+        "source_uri": canonical_uri(source_uri),
+        # Absolute, so a resume from another folder or process writes to the same place.
+        "sink_dir": str(Path(sink_dir or default_sink_dir()).expanduser().resolve()),
+        "contract": contract.model_dump(mode="json"),
+        "as_of": (as_of or dt.date.today()).isoformat(),
+        "auto_approve": auto_approve,
+        "always_pause": always_pause,
+        "reviewer": reviewer,
+        "user_request": user_request,
+        "messages": [],
+    }
+    with tracer().start_as_current_span("shdi.run") as span:
+        span.set_attribute("shdi.run_id", run_id)
+        span.set_attribute("shdi.source", state["source_uri"])
+        span.set_attribute("shdi.contract", contract.name)
+        graph.invoke(state, _config(run_id))
+    return status(run_id, graph)
+
+
+def status(run_id: str, graph: Any = None) -> Dict[str, Any]:
+    graph = graph or build_graph()
+    snap = graph.get_state(_config(run_id))
+    values = snap.values or {}
+    if not values:
+        raise WorkflowError(f"unknown run {run_id}")
+    out: Dict[str, Any] = {
+        "run_id": run_id,
+        "source": values.get("source_uri"),
+        "proposals": values.get("proposals") or [],
+    }
+    interrupts = list(getattr(snap, "interrupts", ()) or ())
+    if not interrupts:
+        for task in snap.tasks or ():
+            interrupts.extend(task.interrupts or ())
+    if interrupts:
+        payload = interrupts[0].value
+        out.update(
+            status="awaiting_approval",
+            pending=payload["pending"],
+            needs_approval=payload["needs_approval"],
+            decisions=payload["decided"],
+        )
+    elif snap.next:
+        out.update(status="interrupted", next=list(snap.next), decisions=values.get("decisions") or {})
+    else:
+        out.update(
+            status="completed",
+            outcome=values.get("status"),
+            decisions=values.get("decisions") or {},
+            apply=values.get("apply"),
+            report=values.get("report"),
+            summary=values.get("summary"),
+            checks_before=values.get("checks_before"),
+            checks_after=values.get("checks_after"),
+        )
+    return out
+
+
+def decide(
+    run_id: str,
+    approved: Iterable[str] = (),
+    rejected: Iterable[str] = (),
+    reviewer: str = "unknown",
+    *,
+    approve_all: bool = False,
+    reject_all: bool = False,
+    graph: Any = None,
+) -> Dict[str, Any]:
+    """Record decisions and resume the run.
+
+    Idempotent: ids that already have a decision are ignored, and calling it on
+    a completed run changes nothing and writes no audit records.
+    """
+    approved, rejected = [str(i) for i in approved], [str(i) for i in rejected]
+    if approve_all and reject_all:
+        raise WorkflowError("choose approve_all or reject_all, not both")
+    both = sorted(set(approved) & set(rejected))
+    if both:
+        raise WorkflowError(f"proposals both approved and rejected: {both}")
+    graph = graph or build_graph()
+    with run_lock(run_id):
+        return _decide(graph, run_id, approved, rejected, reviewer, approve_all, reject_all)
+
+
+def _decide(graph, run_id, approved, rejected, reviewer, approve_all, reject_all) -> Dict[str, Any]:
+    st = status(run_id, graph)
+    known = {p["id"] for p in st["proposals"]}
+    unknown = sorted((set(approved) | set(rejected)) - known)
+    if unknown:
+        raise WorkflowError(f"unknown proposal ids for run {run_id}: {unknown}")
+    if st["status"] == "interrupted":
+        # A node after approval failed (the source was unreachable, a write
+        # failed). Decisions are already recorded; retry from the failed node.
+        with tracer().start_as_current_span("shdi.retry") as span:
+            span.set_attribute("shdi.run_id", run_id)
+            graph.invoke(None, _config(run_id))
+        out = status(run_id, graph)
+        out["ignored"] = sorted(set(approved) | set(rejected))
+        return out
+    if st["status"] != "awaiting_approval":
+        st["ignored"] = sorted(set(approved) | set(rejected))
+        return st
+    already = set(st["decisions"])
+    new_approved = [i for i in approved if i not in already]
+    new_rejected = [i for i in rejected if i not in already]
+    if not (new_approved or new_rejected or approve_all or reject_all) and st["needs_approval"]:
+        # Nothing new to record and a person still has to decide: stay paused.
+        # When nothing needs approval, resuming applies the run (low-risk
+        # proposals are approved by policy), which is how a clean run finishes.
+        st["ignored"] = sorted(set(approved) | set(rejected))
+        return st
+    with tracer().start_as_current_span("shdi.resume") as span:
+        span.set_attribute("shdi.run_id", run_id)
+        span.set_attribute("shdi.reviewer", reviewer)
+        span.set_attribute("shdi.decisions.submitted", len(new_approved) + len(new_rejected))
+        _resume(graph, run_id, new_approved, new_rejected, approve_all, reject_all, reviewer)
+    out = status(run_id, graph)
+    out["ignored"] = sorted((set(approved) | set(rejected)) & already)
+    return out
+
+
+def _resume(graph, run_id, new_approved, new_rejected, approve_all, reject_all, reviewer) -> None:
+    graph.invoke(
+        Command(
+            resume={
+                "approved": new_approved,
+                "rejected": new_rejected,
+                "approve_all": approve_all,
+                "reject_all": reject_all,
+                "reviewer": reviewer,
+                "decided_at": now_iso(),
+            }
+        ),
+        _config(run_id),
+    )
+
+
+def audit_records(run_id: str) -> list:
+    return AuditLog().events(run_id)

@@ -1,0 +1,3 @@
+-r requirements.txt
+# Optional: lets SHDI_LLM=plan or explain call DigitalOcean Gradient.
+langchain-gradient
