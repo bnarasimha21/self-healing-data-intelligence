@@ -52,6 +52,14 @@ columns:
   notes:  {type: string}
 ```
 
+Types are parsed strictly. Dates must be complete (`2024-05` or `May 2024` is
+not a date, rather than being filled in from today), timestamps with a time zone
+are converted to UTC, integers must fit in 64 bits, and only ASCII digits count
+as digits. A contract that could not work is rejected when it loads: `min` or
+`max` on a string or boolean column, a fractional bound on an integer column, a
+`default` that does not parse or is outside `accepted_values`, and a unit
+factor that is zero, negative or 1.
+
 Each check has a severity (`error` or `warn`) and an `on_violation` action
 (`propose_fix`, `quarantine` or `report_only`), with defaults per check kind and
 overrides per column or for the whole dataset. Unknown keys are rejected, so a
@@ -100,7 +108,21 @@ shdi audit <run_id>
 
 For CSV sources the output goes to `$SHDI_SINK_DIR` (default `.shdi/out/`) as
 `<name>__shdi_staging.csv` and `<name>__shdi_quarantine.csv`. Checkpoints and
-the audit log live in `$SHDI_HOME` (default `.shdi/`).
+the audit log live in `$SHDI_HOME` (default `.shdi/` in the current folder, so
+run every command for one run from the same folder, or set `SHDI_HOME` to an
+absolute path). The sink folder is stored as an absolute path when the run
+starts, so `approve` writes to the same place wherever it runs from.
+
+Exit codes: 0 when the run passed or is waiting for a reviewer, 1 when it
+completed with checks still failing (`failed_checks`), when the source changed
+during the pause (`stale_source`), or when it was interrupted, and 2 for a usage
+error such as an unknown run or a contract that does not load.
+
+`start` and `approve`/`reject` take a per-run lock, so two reviewers deciding
+the same run at once apply it once. If applying fails part way (the source file
+was moved, the database was down), the run stays `interrupted` with its
+decisions saved; fix the cause and run `shdi approve <run_id>` again to retry.
+A run id that already has audit records cannot be reused.
 
 ## Sources and sinks
 
@@ -124,6 +146,21 @@ or the command line: `SHDI_PG_DSN` reads the source (give it a role with
 Postgres tables have no insertion order, so the source is read sorted on every
 column; `shdi_source_row` is the position in that order, and row keys in
 proposals and the audit log always include the primary key.
+
+Table names must be plain identifiers, `table` or `schema.table` with ASCII
+letters, digits and underscores. DuckDB would otherwise read a file named in the
+table position (`#"/etc/passwd"`), so that is refused, and every DuckDB
+connection is also opened with file and network access turned off.
+
+When a later run writes a column the sink table cannot hold, the column is
+widened instead of failing or rounding: integer to double, anything else to
+text, and new columns are added. Postgres columns outside the contract keep
+their values but not always their type: integers, numbers, booleans, dates and
+timestamps keep it, while json and array columns land in staging as JSON text and other types
+(point, xml) as their text form.
+
+Two CSV sources with the same file name in different folders share a sink file
+name. Give them different `--sink-dir` folders.
 
 In-memory DuckDB is not accepted, because a paused run must be able to re-open
 the source later. To try DuckDB with the sample:
