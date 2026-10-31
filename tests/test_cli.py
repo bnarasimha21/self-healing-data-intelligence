@@ -37,13 +37,16 @@ def test_cli_run_review_decide_audit(dirty_csv, tmp_path):
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout)["status"] == "awaiting_approval"
 
+    # The rescale was rejected, so max:sales still fails: the run completes and
+    # the exit code says so (1), which is what a script or CI job checks.
     r = shdi("approve", "cli1", "--all", "--reviewer", "erin", env_home=home)
-    assert r.returncode == 0, r.stderr
-    assert "Run cli1:" in r.stdout and "Before/after" in r.stdout
+    assert r.returncode == 1, r.stderr
+    assert "Run cli1: failed_checks" in r.stdout and "Before/after" in r.stdout
 
     r = shdi("status", "cli1", "--json", env_home=home)
+    assert r.returncode == 1
     done = json.loads(r.stdout)
-    assert done["status"] == "completed"
+    assert done["status"] == "completed" and done["outcome"] == "failed_checks"
     assert done["decisions"][rescale]["decision"] == "rejected"
     assert (sink / "dirty_sales__shdi_staging.csv").exists()
     assert (sink / "dirty_sales__shdi_quarantine.csv").exists()
@@ -55,7 +58,7 @@ def test_cli_run_review_decide_audit(dirty_csv, tmp_path):
     assert all(e["reviewer"] == "erin" for e in events if e["event"] == "decision" and e["proposal_id"] == rescale)
 
     r = shdi("approve", "cli1", "--ids", rescale, env_home=home)
-    assert r.returncode == 0 and "already decided, ignored" in r.stdout
+    assert r.returncode == 1 and "already decided, ignored" in r.stdout
 
 
 def test_cli_errors_are_clean(tmp_path):

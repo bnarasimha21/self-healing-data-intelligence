@@ -6,13 +6,17 @@ started by one process can be reviewed and resumed by another.
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
+import hashlib
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Union
 
 from langgraph.types import Command
 
 from .audit import AuditLog, now_iso
+from .config import home, llm_mode, sink_dir as default_sink_dir
 from .connectors import canonical_uri
 from .contract import Contract, load_contract
 from .graph import build_graph
@@ -25,6 +29,23 @@ class WorkflowError(ValueError):
 
 def _config(run_id: str) -> Dict[str, Any]:
     return {"configurable": {"thread_id": run_id}}
+
+
+@contextmanager
+def run_lock(run_id: str):
+    """Serialise start and decide on one run across processes (CLI, MCP server).
+
+    Without it two reviewers resuming the same run at once can each apply,
+    leaving the audit log and the staging output disagreeing."""
+    d = home() / "locks"
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / (hashlib.sha256(run_id.encode()).hexdigest()[:32] + ".lock")
+    with open(path, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def start_run(
@@ -44,14 +65,25 @@ def start_run(
         contract = load_contract(contract)
     if isinstance(contract, dict):
         contract = Contract.model_validate(contract)
+    llm_mode()  # a bad SHDI_LLM fails here, before a run exists
     graph = graph or build_graph()
     run_id = run_id or uuid.uuid4().hex[:12]
+    with run_lock(run_id):
+        return _start(graph, run_id, source_uri, contract, auto_approve, reviewer, sink_dir, as_of,
+                      user_request, always_pause)
+
+
+def _start(graph, run_id, source_uri, contract, auto_approve, reviewer, sink_dir, as_of, user_request, always_pause):
     if graph.get_state(_config(run_id)).values:
         raise WorkflowError(f"run {run_id} already exists")
+    if AuditLog().events(run_id):
+        # The audit log outlived the checkpoint; reusing the id would mix two runs' records.
+        raise WorkflowError(f"run id {run_id} already has audit records; choose another id")
     state = {
         "run_id": run_id,
         "source_uri": canonical_uri(source_uri),
-        "sink_dir": sink_dir,
+        # Absolute, so a resume from another folder or process writes to the same place.
+        "sink_dir": str(Path(sink_dir or default_sink_dir()).expanduser().resolve()),
         "contract": contract.model_dump(mode="json"),
         "as_of": (as_of or dt.date.today()).isoformat(),
         "auto_approve": auto_approve,
@@ -129,11 +161,25 @@ def decide(
     if both:
         raise WorkflowError(f"proposals both approved and rejected: {both}")
     graph = graph or build_graph()
+    with run_lock(run_id):
+        return _decide(graph, run_id, approved, rejected, reviewer, approve_all, reject_all)
+
+
+def _decide(graph, run_id, approved, rejected, reviewer, approve_all, reject_all) -> Dict[str, Any]:
     st = status(run_id, graph)
     known = {p["id"] for p in st["proposals"]}
     unknown = sorted((set(approved) | set(rejected)) - known)
     if unknown:
         raise WorkflowError(f"unknown proposal ids for run {run_id}: {unknown}")
+    if st["status"] == "interrupted":
+        # A node after approval failed (the source was unreachable, a write
+        # failed). Decisions are already recorded; retry from the failed node.
+        with tracer().start_as_current_span("shdi.retry") as span:
+            span.set_attribute("shdi.run_id", run_id)
+            graph.invoke(None, _config(run_id))
+        out = status(run_id, graph)
+        out["ignored"] = sorted(set(approved) | set(rejected))
+        return out
     if st["status"] != "awaiting_approval":
         st["ignored"] = sorted(set(approved) | set(rejected))
         return st

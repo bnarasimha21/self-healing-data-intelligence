@@ -58,6 +58,18 @@ def print_status(st: Dict[str, Any], as_json: bool) -> None:
         print(f"already decided, ignored: {', '.join(st['ignored'])}")
 
 
+FAILED_OUTCOMES = ("failed_checks", "stale_source")
+
+
+def exit_code(st: Dict[str, Any]) -> int:
+    """0 when the run is fine or waiting for a reviewer, 1 when it ended badly or was interrupted."""
+    if st.get("status") == "interrupted":
+        return 1
+    if st.get("status") == "completed" and st.get("outcome") in FAILED_OUTCOMES:
+        return 1
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="shdi", description="Self-healing data intelligence")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -94,6 +106,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     i.add_argument("--name", default=None)
 
     args = ap.parse_args(argv)
+    code = 0
     try:
         if args.cmd == "run":
             st = workflow.start_run(
@@ -105,8 +118,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 sink_dir=args.sink_dir,
             )
             print_status(st, args.json)
+            code = exit_code(st)
         elif args.cmd in ("review", "status"):
-            print_status(workflow.status(args.run_id), args.json)
+            st = workflow.status(args.run_id)
+            print_status(st, args.json)
+            code = exit_code(st)
         elif args.cmd in ("approve", "reject"):
             reviewer = args.reviewer or getpass.getuser()
             ids = args.ids or []
@@ -119,6 +135,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 reject_all=args.all and args.cmd == "reject",
             )
             print_status(st, args.json)
+            code = exit_code(st)
         elif args.cmd == "audit":
             for e in workflow.audit_records(args.run_id):
                 print(json.dumps({k: e[k] for k in ("seq", "ts", "proposal_id", "event", "decision", "reviewer", "rule",
@@ -136,7 +153,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     finally:
         flush_traces()
-    return 0
+    return code
 
 
 if __name__ == "__main__":
