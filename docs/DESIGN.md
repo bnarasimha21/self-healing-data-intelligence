@@ -54,33 +54,11 @@ How it has to behave:
 
 One linear LangGraph run with a single pause. Only one node writes data.
 
-```mermaid
-flowchart LR
-    SRC[(Source<br/>CSV, DuckDB, Postgres<br/>read-only)]
-    CON[/Data contract<br/>YAML/]
+![One run through the pipeline, with every exit](images/run-flow.svg)
 
-    subgraph Run["LangGraph run, checkpointed to SQLite"]
-        P[plan] --> L[load<br/>fingerprint] --> V[validate] --> PR[propose] --> A{approve<br/>interrupt}
-        A --> AP[apply] --> S[summarize]
-    end
+Where it runs today. Both front doors, the CLI and the MCP server, drive the same run on one host.
 
-    REV[Reviewer<br/>CLI or MCP client]
-    STG[(staging)]
-    QUA[(quarantine)]
-    AUD[(Audit log<br/>append-only SQLite)]
-    OTL[OpenTelemetry spans]
-
-    CON --> V
-    SRC --> L
-    SRC -. re-read, fingerprint must match .-> AP
-    A -- proposals --> REV
-    REV -- approve or reject by id --> A
-    A --> AUD
-    AP --> STG
-    AP --> QUA
-    AP --> AUD
-    Run --> OTL
-```
+![The two ways it runs today, with trust boundaries](images/deployment.svg)
 
 | Node | Reads the source | Writes | Notes |
 |------|------------------|--------|-------|
