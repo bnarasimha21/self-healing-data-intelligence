@@ -8,6 +8,9 @@ Every decision and every applied change is recorded in an append-only audit
 log, keyed by row and carrying the old and new values. That includes type casts
 and added columns, which list every row they touch.
 
+Why it is built this way, with the trade-offs, measured numbers and what changes at scale:
+[docs/DESIGN.md](docs/DESIGN.md).
+
 ## How a run flows
 
 ```
